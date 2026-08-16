@@ -1,0 +1,99 @@
+#!/usr/bin/env bash
+# Cut a release: bump, tag, push, wait for the binaries, update the tap.
+#
+#     scripts/release 1.0.1
+#
+# One command because the second half — copying the generated formula into
+# the tap — is the step that gets forgotten, and a release without it is one
+# nobody can install. Everything runs with your own credentials; the release
+# workflow needs no token that can write to another repository.
+#
+# What it will not do: re-run a tag that already exists. The tarballs are
+# rebuilt with new mtimes, so their checksums change under the same URLs, and
+# the formula already in the tap would refuse to install them. A mistake in a
+# published release is a new version.
+set -euo pipefail
+
+REPO=noih/difv
+TAP=noih/tap
+TAP_REPO=git@github.com:noih/homebrew-tap.git
+
+version=${1:-}
+[[ $version =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "usage: scripts/release X.Y.Z" >&2; exit 2; }
+tag=v$version
+
+say() { printf '\n\033[1m==> %s\033[0m\n' "$*"; }
+die() { echo "release: $*" >&2; exit 1; }
+
+# --- preconditions -----------------------------------------------------------
+
+[[ $(git branch --show-current) == main ]] || die "run this on main"
+[[ -z $(git status --porcelain) ]] || die "working tree is not clean"
+git fetch -q origin
+[[ $(git rev-parse HEAD) == $(git rev-parse origin/main) ]] || die "main is not in sync with origin — push or pull first"
+git rev-parse -q --verify "refs/tags/$tag" >/dev/null && die "$tag already exists — a mistake in a published release is a new version"
+gh auth status >/dev/null 2>&1 || die "gh is not logged in"
+command -v cargo >/dev/null || die "cargo not found"
+
+# --- bump --------------------------------------------------------------------
+
+say "bump to $version"
+# Only the [package] version — the first `version =` line — never a dependency's.
+awk -v v="$version" '!done && /^version = "/ { sub(/"[^"]+"/, "\"" v "\""); done=1 } { print }' Cargo.toml > Cargo.toml.new
+mv Cargo.toml.new Cargo.toml
+cargo check -q                              # refreshes Cargo.lock's own entry
+grep -q "^version = \"$version\"" Cargo.toml || die "Cargo.toml did not take the bump"
+
+say "the checks CI will run"
+cargo fmt --check
+cargo clippy --all-targets -- -D warnings
+cargo test -q
+
+git add Cargo.toml Cargo.lock
+git commit -q -m "release: $version"
+git tag -a "$tag" -m "difv $version"
+
+# --- publish -----------------------------------------------------------------
+
+say "push main and $tag"
+git push origin main "$tag"
+
+say "wait for the release workflow"
+run=""
+for _ in $(seq 1 30); do
+  run=$(gh run list --repo "$REPO" --workflow release --branch "$tag" --limit 1 --json databaseId --jq '.[0].databaseId // empty')
+  [[ -n $run ]] && break
+  sleep 5
+done
+[[ -n $run ]] || die "the release workflow did not start — check Actions on $REPO"
+gh run watch --repo "$REPO" "$run" --exit-status
+gh release view "$tag" --repo "$REPO" --json assets --jq '.assets[].name' | grep -qx difv.rb \
+  || die "the release has no difv.rb — the formula step failed"
+
+# --- tap ---------------------------------------------------------------------
+
+say "update the tap"
+if command -v brew >/dev/null; then
+  brew tap "$TAP" >/dev/null 2>&1 || true
+  tapdir=$(brew --repository "$TAP")
+  git -C "$tapdir" pull -q --ff-only
+else
+  tapdir=$(mktemp -d)
+  git clone -q "$TAP_REPO" "$tapdir"
+fi
+gh release download "$tag" --repo "$REPO" --pattern difv.rb --dir "$tapdir/Formula" --clobber
+
+if command -v brew >/dev/null; then
+  # The same checks the tap's test-bot runs, so a red build is caught here.
+  brew style "$TAP"
+  brew readall --os=all --arch=all "$TAP"
+  brew audit --strict --online "$TAP/difv"
+fi
+
+git -C "$tapdir" add Formula/difv.rb
+git -C "$tapdir" commit -q -m "difv $version"
+git -C "$tapdir" push -q origin HEAD
+
+say "released $tag"
+echo "  https://github.com/$REPO/releases/tag/$tag"
+echo "  brew upgrade difv    # or: brew install $TAP/difv"
