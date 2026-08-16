@@ -1,0 +1,23 @@
+name: ci
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup component add rustfmt clippy
+      # Formatting drifts a hunk at a time and is invisible in review, so it is
+      # the first thing checked rather than something to remember.
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+      # The tests drive a real repository through git, so they need an identity.
+      - name: Test
+        run: |
+          git config --global user.email ci@difv
+          git config --global user.name difv
+          cargo test --locked

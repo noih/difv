@@ -1,0 +1,39 @@
+# Filled in by .github/workflows/release.yml and attached to each release as
+# difv.rb. Copy it into the tap repository (noih/homebrew-tap) as
+# Formula/difv.rb — see the Install section of the README.
+class Difv < Formula
+  desc "Review and tweak your Git changes side by side, in the terminal"
+  homepage "https://github.com/noih/difv"
+  version "${VERSION}"
+  license "MIT"
+
+  # Apple Silicon only. An Intel Mac gets a clear refusal from Homebrew rather
+  # than a formula with nothing to download; `cargo install` still works there.
+  on_macos do
+    depends_on arch: :arm64
+    url "${URL_BASE}/difv-v${VERSION}-aarch64-apple-darwin.tar.gz"
+    sha256 "${MAC_ARM}"
+  end
+
+  on_linux do
+    on_arm do
+      url "${URL_BASE}/difv-v${VERSION}-aarch64-unknown-linux-gnu.tar.gz"
+      sha256 "${LINUX_ARM}"
+    end
+    on_intel do
+      url "${URL_BASE}/difv-v${VERSION}-x86_64-unknown-linux-gnu.tar.gz"
+      sha256 "${LINUX_INTEL}"
+    end
+  end
+
+  # difv shells out to git rather than linking a git library.
+  depends_on "git"
+
+  def install
+    bin.install "difv"
+  end
+
+  test do
+    assert_match "difv #{version}", shell_output("#{bin}/difv --version")
+  end
+end

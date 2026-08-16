@@ -1,0 +1,93 @@
+name: release
+
+# Tag a release and this builds the binaries people install, so difv can be
+# had without a Rust toolchain:
+#
+#     git tag v0.1.0 && git push origin v0.1.0
+#
+# Everything here runs through the `gh` CLI, which is on every runner, rather
+# than through third-party actions whose major versions move under the feet of
+# a workflow that only runs a few times a year.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing tag to build
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  TAG: ${{ inputs.tag || github.ref_name }}
+
+jobs:
+  draft:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+      - name: Open a draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view "$TAG" >/dev/null 2>&1 ||
+            gh release create "$TAG" --draft --title "$TAG" --generate-notes
+
+  build:
+    needs: draft
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: macos-15, target: aarch64-apple-darwin }
+          - { os: ubuntu-24.04, target: x86_64-unknown-linux-gnu }
+          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+      - run: rustup target add ${{ matrix.target }}
+      - run: cargo build --release --locked --target ${{ matrix.target }}
+      - name: Package
+        run: |
+          name="difv-$TAG-${{ matrix.target }}"
+          tar -czf "$name.tar.gz" -C "target/${{ matrix.target }}/release" difv
+          shasum -a 256 "$name.tar.gz" | tee "$name.tar.gz.sha256"
+      - name: Attach to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$TAG" difv-*.tar.gz difv-*.tar.gz.sha256 --clobber
+
+  formula:
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+      # The formula carries a checksum per platform, and hand-copying four of
+      # them is how a tap ends up shipping a stale one.
+      - name: Write the Homebrew formula
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          gh release download "$TAG" --pattern '*.sha256' --dir sums
+          sum() { awk '{print $1}' "sums/difv-$TAG-$1.tar.gz.sha256"; }
+          export VERSION="${TAG#v}"
+          export URL_BASE="https://github.com/$REPO/releases/download/$TAG"
+          export MAC_ARM=$(sum aarch64-apple-darwin)
+          export LINUX_ARM=$(sum aarch64-unknown-linux-gnu)
+          export LINUX_INTEL=$(sum x86_64-unknown-linux-gnu)
+          envsubst < packaging/difv.rb.template > difv.rb
+          cat difv.rb
+          gh release upload "$TAG" difv.rb --clobber
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release edit "$TAG" --draft=false

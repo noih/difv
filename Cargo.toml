@@ -1,0 +1,19 @@
+[package]
+name = "difv"
+version = "1.0.0"
+edition = "2024"
+rust-version = "1.88"
+description = "Review and tweak your Git changes side by side, in the terminal."
+license = "MIT"
+repository = "https://github.com/noih/difv"
+
+[dependencies]
+anyhow = "1"
+crossterm = "0.29"
+libc = "0.2.189"
+ratatui = "0.30"
+ratatui-textarea = { version = "0.9", default-features = false, features = ["crossterm"] }
+serde = { version = "1.0.229", features = ["derive"] }
+similar = "3"
+toml = "1.1.4"
+unicode-width = "0.2"
