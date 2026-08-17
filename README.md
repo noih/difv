@@ -35,14 +35,12 @@ Apple Silicon macOS and Linux. `git` has to be on your `PATH`.
 
 Run `difv` inside a Git repository. That is the whole command line.
 
-- Click or arrow around. The right pane is editable: focus it and type. `Ctrl+S`
-  saves, `Ctrl+Z` undoes, `Esc` gets you back to the file list.
-- `?` shows every key. `,` opens the settings.
-- Mouse works throughout: click, drag to select, drag a border to resize, wheel
-  over any pane.
-
-Settings live in `~/.config/difv/config.toml` and are also editable from `,`.
-Every option is explained there.
+- Click, scroll, or arrow around; drag a border to resize; drag to select and
+  `Ctrl+C` to copy from either side; right-click a file to copy its path. The
+  right pane is editable: focus it and type. `Ctrl+S` saves, `Ctrl+Z` undoes,
+  `Esc` gets you back to the file list.
+- `?` shows every key. `,` opens the settings, which are also plain TOML in
+  `~/.config/difv/config.toml` with every option explained.
 
 ## License
 
