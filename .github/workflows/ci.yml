@@ -9,7 +9,7 @@ jobs:
   check:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: rustup component add rustfmt clippy
       # Formatting drifts a hunk at a time and is invisible in review, so it is
       # the first thing checked rather than something to remember.
