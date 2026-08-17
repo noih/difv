@@ -30,6 +30,25 @@ struct LastEdit {
     when: Instant,
 }
 
+/// The text a sorted `(from, to)` selection covers, `(row, col)` in chars, `to`
+/// exclusive. Shared by the editor and the read-only HEAD side.
+pub fn slice_selection(lines: &[String], range: Selection) -> String {
+    let ((from_row, from_col), (to_row, to_col)) = range;
+    if from_row == to_row {
+        return slice_chars(&lines[from_row], from_col, to_col);
+    }
+    let mut out = slice_chars(&lines[from_row], from_col, usize::MAX);
+    for line in &lines[from_row + 1..to_row] {
+        out.push('\n');
+        out.push_str(line);
+    }
+    out.push('\n');
+    out.push_str(&slice_chars(&lines[to_row], 0, to_col));
+    out
+}
+
+pub type Selection = ((usize, usize), (usize, usize));
+
 /// The Current pane's text. Wraps `ratatui-textarea` for cursor, selection, and
 /// unicode handling, but keeps its own undo stack: the crate records one entry
 /// per edit with no merging, and a single input can push more than one, so
@@ -82,24 +101,12 @@ impl EditorBuffer {
         (cursor.0, cursor.1)
     }
 
-    pub fn selection(&self) -> Option<((usize, usize), (usize, usize))> {
+    pub fn selection(&self) -> Option<Selection> {
         self.area.selection_range()
     }
 
     pub fn selected_text(&self) -> Option<String> {
-        let ((from_row, from_col), (to_row, to_col)) = self.selection()?;
-        let lines = self.lines();
-        if from_row == to_row {
-            return Some(slice_chars(&lines[from_row], from_col, to_col));
-        }
-        let mut out = slice_chars(&lines[from_row], from_col, usize::MAX);
-        for line in &lines[from_row + 1..to_row] {
-            out.push('\n');
-            out.push_str(line);
-        }
-        out.push('\n');
-        out.push_str(&slice_chars(&lines[to_row], 0, to_col));
-        Some(out)
+        Some(slice_selection(self.lines(), self.selection()?))
     }
 
     pub fn dirty(&self) -> bool {

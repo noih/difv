@@ -310,9 +310,11 @@ fn draw_side(frame: &mut Frame, app: &App, area: Rect, side: Pane) {
     let gutter = gutter_width(lines_src.len());
     let text_width = width.saturating_sub(gutter + 1);
     let tab = app.tab_width();
-    let selection = (!old_side)
-        .then(|| app.buffer().and_then(|b| b.selection()))
-        .flatten();
+    let selection = if old_side {
+        app.old_selection()
+    } else {
+        app.buffer().and_then(|b| b.selection())
+    };
 
     let mut lines: Vec<Line> = Vec::with_capacity(height);
     for row in app.diff.rows.iter().skip(app.scroll).take(height) {

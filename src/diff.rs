@@ -218,11 +218,19 @@ impl DiffModel {
     /// The buffer line a visual row stands for. A phantom row belongs to no
     /// line, so it resolves to the next one that follows, or the last line.
     pub fn new_line_at_or_after(&self, row: usize) -> Option<usize> {
+        self.line_at_or_after(row, |row| row.new_line)
+    }
+
+    pub fn old_line_at_or_after(&self, row: usize) -> Option<usize> {
+        self.line_at_or_after(row, |row| row.old_line)
+    }
+
+    fn line_at_or_after(&self, row: usize, side: fn(&DiffRow) -> Option<usize>) -> Option<usize> {
         self.rows
             .get(row..)?
             .iter()
-            .find_map(|row| row.new_line)
-            .or_else(|| self.rows.iter().rev().find_map(|row| row.new_line))
+            .find_map(side)
+            .or_else(|| self.rows.iter().rev().find_map(side))
     }
 
     pub fn changed_row_after(&self, from: usize) -> Option<usize> {

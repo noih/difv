@@ -8,7 +8,6 @@ mod settings;
 mod ui;
 
 use std::io::stdout;
-use std::time::Duration;
 
 use anyhow::Result;
 use crossterm::event::{
@@ -20,11 +19,6 @@ use crossterm::style::Print;
 
 use app::App;
 use config::Config;
-
-/// How long the user has to be idle before a coarse stretch under the viewport
-/// is refined — after typing that outran the budget, or after scrolling into a
-/// stretch that did. Only armed while there is one on screen.
-const REFINE_PAUSE: Duration = Duration::from_millis(300);
 
 /// Mouse reporting, asked for by hand rather than through `EnableMouseCapture`,
 /// which also turns on any-motion tracking (`?1003h`) — an event for every cell
@@ -155,11 +149,13 @@ fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> Result<()> {
         }
 
         // Blocking is the normal case: an idle difv should cost nothing. A
-        // timeout is armed only when a rebuild ran out of time and a pause
-        // would let it finish properly.
-        let pending = app.wants_refine();
-        if pending && !event::poll(REFINE_PAUSE)? {
-            app.refine();
+        // timeout is armed only while something is due without input — a held
+        // drag past an edge, a notice about to fade, a rebuild that ran out of
+        // time and a pause would let finish.
+        if let Some(timeout) = app.next_tick()
+            && !event::poll(timeout)?
+        {
+            app.tick();
             dirty = true;
             continue;
         }

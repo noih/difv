@@ -10,7 +10,7 @@ use ratatui::widgets::ListState;
 use crate::clipboard;
 use crate::config::{self, Config};
 use crate::diff::{self, DiffModel};
-use crate::editor::EditorBuffer;
+use crate::editor::{self, EditorBuffer, Selection};
 use crate::git::{ChangedFile, Repo};
 use crate::settings;
 
@@ -55,12 +55,24 @@ pub struct App {
     pub quit: bool,
     pub error: Option<String>,
     pub notice: Option<String>,
+    /// When `notice` clears itself. Unset, it stays until the next key.
+    notice_until: Option<Instant>,
     pub prompt: Option<Prompt>,
     /// The selected file was rewritten by another process and its buffer has
     /// unsaved edits, so difv flagged it instead of reloading it.
     pub stale: bool,
     disk_stamp: Option<(SystemTime, u64)>,
-    selecting: bool,
+    /// The diff pane a mouse selection is being dragged in, from press to
+    /// release. Kept apart from `focus`, which a key or the wheel can move
+    /// mid-drag.
+    selecting: Option<Pane>,
+    /// A mouse selection on the HEAD side, `(anchor, head)` in the order it was
+    /// made. That side has no editor, so this is the whole of its state.
+    old_selection: Option<Selection>,
+    /// Where the pointer was on the last drag that reached past the edge of the
+    /// pane being selected in, so the view keeps scrolling toward it while the
+    /// button is held still — the terminal only reports a drag that moves.
+    edge_drag: Option<Position>,
     /// Rects from the last render, kept so mouse clicks can be mapped back.
     pub panes: [Rect; 3],
     /// The area the three panes share, so a divider drag can be bounded.
@@ -99,6 +111,17 @@ const MIN_PANE: u16 = 8;
 /// Columns one `←`/`→` or one sideways trackpad notch moves.
 const HSCROLL_STEP: isize = 4;
 
+/// How long the user has to be idle before a coarse stretch under the viewport
+/// is refined — after typing that outran the budget, or after scrolling into a
+/// stretch that did. Only armed while there is one on screen.
+const REFINE_PAUSE: Duration = Duration::from_millis(300);
+
+/// How often the view moves while a drag is held past a pane edge.
+const AUTOSCROLL_TICK: Duration = Duration::from_millis(50);
+
+/// How long a self-clearing footer notice stays.
+const NOTICE_TTL: Duration = Duration::from_secs(2);
+
 impl App {
     pub fn new(config: Config) -> Result<Self> {
         let repo = Repo::discover()?;
@@ -128,10 +151,13 @@ impl App {
             quit: false,
             error: None,
             notice: None,
+            notice_until: None,
             prompt: None,
             stale: false,
             disk_stamp: None,
-            selecting: false,
+            selecting: None,
+            old_selection: None,
+            edge_drag: None,
             panes: [Rect::ZERO; 3],
             body: Rect::ZERO,
             viewport_height: 1,
@@ -186,6 +212,19 @@ impl App {
         self.focus == Pane::New && self.buffer().is_some()
     }
 
+    /// The HEAD-side selection, sorted, or none when it covers nothing.
+    pub fn old_selection(&self) -> Option<Selection> {
+        let (a, b) = self.old_selection?;
+        (a != b).then(|| (a.min(b), a.max(b)))
+    }
+
+    pub fn old_selected_text(&self) -> Option<String> {
+        Some(editor::slice_selection(
+            &self.diff.old,
+            self.old_selection()?,
+        ))
+    }
+
     pub fn dirty_files(&self) -> Vec<&PathBuf> {
         self.buffers
             .iter()
@@ -221,6 +260,7 @@ impl App {
         let content = self.repo.worktree_content(&file);
         self.disk_stamp = self.stamp(&file);
         self.stale = false;
+        self.old_selection = None;
 
         self.readonly.clear();
         match content.editable() {
@@ -625,6 +665,7 @@ impl App {
 
     pub fn on_key(&mut self, key: KeyEvent) {
         self.notice = None;
+        self.notice_until = None;
         if let Some(prompt) = self.prompt {
             self.answer(prompt, key);
             return;
@@ -745,7 +786,15 @@ impl App {
         let page = self.viewport_height.max(1) as isize;
         match key.code {
             KeyCode::Char('q') => self.request_quit(),
-            KeyCode::Char('c') if ctrl => self.request_quit(),
+            KeyCode::Char('c') if ctrl => {
+                if self.focus == Pane::Old
+                    && let Some(text) = self.old_selected_text()
+                {
+                    clipboard::copy(&text);
+                } else {
+                    self.request_quit();
+                }
+            }
             KeyCode::Char('r') => self.request_reload(),
             KeyCode::Char(',') => self.settings = Some(0),
             KeyCode::Char('?') => self.help = true,
@@ -1021,6 +1070,8 @@ impl App {
                 // A release outside the terminal never arrives, so a stale drag
                 // would turn the next selection into a resize.
                 self.drag = None;
+                self.edge_drag = None;
+                self.selecting = None;
                 let Some(pane) = over else { return };
                 self.focus = pane;
                 match pane {
@@ -1034,29 +1085,42 @@ impl App {
                     }
                     Pane::New => {
                         if let Some((row, col)) = self.buffer_position(at) {
-                            self.selecting = true;
+                            self.selecting = Some(Pane::New);
                             if let Some(buffer) = self.buffer_mut() {
                                 buffer.move_cursor_to(row, col);
                                 buffer.start_selection();
                             }
                         }
                     }
-                    Pane::Old => {}
+                    Pane::Old => {
+                        if let Some(at) = self.text_position(Pane::Old, at) {
+                            self.selecting = Some(Pane::Old);
+                            self.old_selection = Some((at, at));
+                        }
+                    }
+                }
+            }
+            // The gesture is "take this", not "go here": the row under the
+            // pointer is copied and the selection stays where it was.
+            MouseEventKind::Down(MouseButton::Right) if over == Some(Pane::Files) => {
+                let offset = mouse.row.saturating_sub(self.panes[0].y + 1) as usize;
+                if let Some(file) = self.files.get(self.file_state.offset() + offset) {
+                    let path = file.path.display().to_string();
+                    clipboard::copy(&path);
+                    self.notice = Some(format!("Copied {path}"));
+                    self.notice_until = Some(Instant::now() + NOTICE_TTL);
                 }
             }
             MouseEventKind::Drag(MouseButton::Left) if let Some(index) = self.drag => {
                 self.drag_divider(index, at.x);
             }
-            MouseEventKind::Drag(MouseButton::Left) if self.selecting => {
-                if let Some((row, col)) = self.buffer_position(at)
-                    && let Some(buffer) = self.buffer_mut()
-                {
-                    buffer.move_cursor_to_keeping_selection(row, col);
-                }
+            MouseEventKind::Drag(MouseButton::Left) if let Some(pane) = self.selecting => {
+                self.extend_selection(pane, at);
             }
             MouseEventKind::Up(MouseButton::Left) => {
                 self.drag = None;
-                if self.selecting
+                self.edge_drag = None;
+                if self.selecting == Some(Pane::New)
                     && self
                         .buffer()
                         .and_then(EditorBuffer::selected_text)
@@ -1065,7 +1129,7 @@ impl App {
                 {
                     buffer.cancel_selection();
                 }
-                self.selecting = false;
+                self.selecting = None;
             }
             // The wheel carries a position like any other mouse event, so the
             // pane under the pointer is the one the user means — following it
@@ -1097,6 +1161,98 @@ impl App {
         }
     }
 
+    /// Grow the selection to the pointer. Past an edge of the pane, the view
+    /// scrolls a step toward the pointer as well and the selection reaches the
+    /// text that just came into view — dragging to the border is how the rest
+    /// of a long line is reached, as in any editor.
+    fn extend_selection(&mut self, pane: Pane, at: Position) {
+        let rect = self.panes[pane as usize];
+        let lines = match pane {
+            Pane::Old => self.diff.old.len(),
+            _ => self.new_lines().len(),
+        };
+        let gutter = crate::ui::gutter_width(lines) as u16 + 1;
+        let (left, right) = (rect.x + 1 + gutter, (rect.x + rect.width).saturating_sub(2));
+        let (top, bottom) = (rect.y + 1, (rect.y + rect.height).saturating_sub(2));
+
+        // Worth ticking again only while there is room in the direction asked
+        // for. Judged before the step rather than by whether anything moved:
+        // while editing, the frame's clamp widens `hscroll` by one column for
+        // the cursor at the right limit, and the next step would "move" it
+        // back — a change every tick, forever.
+        let room = (at.x < left && self.hscroll > 0)
+            || (at.x > right && self.hscroll < self.max_hscroll())
+            || (at.y < top && self.scroll > 0)
+            || (at.y > bottom && self.scroll < self.max_scroll());
+        self.edge_drag = room.then_some(at);
+        if at.x < left {
+            self.scroll_sideways(-HSCROLL_STEP);
+        } else if at.x > right {
+            self.scroll_sideways(HSCROLL_STEP);
+        }
+        if at.y < top {
+            self.scroll_by(-1);
+        } else if at.y > bottom {
+            self.scroll_by(1);
+        }
+        // Past the right edge the head goes one column beyond the last visible
+        // one: that is what takes in the character under it, and the end of
+        // the line once the view is scrolled all the way.
+        let inside = Position::new(at.x.max(left).min(right + 1), at.y.max(top).min(bottom));
+        let Some((row, col)) = self.text_position(pane, inside) else {
+            return;
+        };
+        if pane == Pane::Old {
+            if let Some((anchor, _)) = self.old_selection {
+                self.old_selection = Some((anchor, (row, col)));
+            }
+        } else if let Some(buffer) = self.buffer_mut() {
+            buffer.move_cursor_to_keeping_selection(row, col);
+        }
+    }
+
+    /// A drag is being held past a pane edge and the view can still move.
+    pub fn dragging_past_edge(&self) -> bool {
+        self.selecting.is_some() && self.edge_drag.is_some()
+    }
+
+    /// One more step of the scroll a held drag asked for.
+    fn autoscroll(&mut self) {
+        if let (Some(pane), Some(at)) = (self.selecting, self.edge_drag) {
+            self.extend_selection(pane, at);
+        }
+    }
+
+    /// How long until something is due without any input, if anything is.
+    /// `None` is the idle case: the event loop blocks.
+    pub fn next_tick(&self) -> Option<Duration> {
+        if self.dragging_past_edge() {
+            return Some(AUTOSCROLL_TICK);
+        }
+        let notice = self
+            .notice_until
+            .map(|until| until.saturating_duration_since(Instant::now()));
+        let refine = self.wants_refine().then_some(REFINE_PAUSE);
+        [notice, refine].into_iter().flatten().min()
+    }
+
+    /// Service whatever `next_tick` was waiting on, soonest first. A wake-up
+    /// for one of them restarts the wait for the others, which only matters to
+    /// the refine pause — and that is a pause, not a deadline.
+    pub fn tick(&mut self) {
+        if self.dragging_past_edge() {
+            self.autoscroll();
+        } else if self
+            .notice_until
+            .is_some_and(|until| until <= Instant::now())
+        {
+            self.notice = None;
+            self.notice_until = None;
+        } else if self.wants_refine() {
+            self.refine();
+        }
+    }
+
     /// One wheel notch, in the pane it happened over. The file list moves by one
     /// entry: a selection is a choice, not a distance.
     fn wheel(&mut self, over: Option<Pane>, direction: isize) {
@@ -1121,11 +1277,19 @@ impl App {
     /// phantom row lands on the next real line; clicking past the end of a line
     /// lands at its end.
     pub fn buffer_position(&self, at: Position) -> Option<(usize, usize)> {
-        let pane = self.panes[Pane::New as usize];
+        self.text_position(Pane::New, at)
+    }
+
+    fn text_position(&self, side: Pane, at: Position) -> Option<(usize, usize)> {
+        let pane = self.panes[side as usize];
         let row = self.scroll + at.y.checked_sub(pane.y + 1)? as usize;
-        let line = self.diff.new_line_at_or_after(row)?;
-        let text = self.new_lines().get(line)?;
-        let gutter = crate::ui::gutter_width(self.new_lines().len()) + 1;
+        let (line, lines) = if side == Pane::Old {
+            (self.diff.old_line_at_or_after(row)?, &self.diff.old[..])
+        } else {
+            (self.diff.new_line_at_or_after(row)?, self.new_lines())
+        };
+        let text = lines.get(line)?;
+        let gutter = crate::ui::gutter_width(lines.len()) + 1;
         let column = at.x.checked_sub(pane.x + 1)? as usize;
         let display = column.saturating_sub(gutter) + self.hscroll;
         Some((
@@ -1795,6 +1959,181 @@ pub mod tests {
         // Gutter is one digit wide plus a space, so text starts two cells in.
         let at = Position::new(10 + 1 + 2 + 1, 2 + 1 + 1);
         assert_eq!(app.buffer_position(at), Some((2, 2)));
+    }
+
+    /// The HEAD side has no editor, but a reader still wants to lift text out
+    /// of it: drag to select, `Ctrl+C` copies it — and only then; with nothing
+    /// selected, `Ctrl+C` there still means quit.
+    #[test]
+    fn dragging_across_the_head_side_selects_and_copies_it() {
+        let fixture = Fixture::new("old-select", "one\ntwo\nthree\n", "one\nTWO\nthree\n");
+        let mut app = fixture.app();
+        app.viewport_height = 10;
+        app.panes[Pane::Old as usize] = Rect::new(0, 0, 20, 10);
+        app.panes[Pane::New as usize] = Rect::new(20, 0, 20, 10);
+        let mouse = |kind, column, row| MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        };
+        // Gutter is one digit plus a space, so text starts at column 3 inside
+        // the border. Press on "n" of "one", drag upward-left is sorted too:
+        // release on "w" of "two".
+        app.on_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 4, 1));
+        app.on_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 5, 2));
+        app.on_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 5, 2));
+        assert_eq!(app.focus, Pane::Old);
+        assert_eq!(app.old_selection(), Some(((0, 1), (1, 2))));
+        assert_eq!(app.old_selected_text().as_deref(), Some("ne\ntw"));
+
+        app.on_key(ctrl('c'));
+        assert!(
+            app.prompt.is_none() && !app.quit,
+            "Ctrl+C copied, did not quit"
+        );
+
+        // A click without a drag selects nothing, so Ctrl+C is quit again.
+        app.on_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 4, 1));
+        app.on_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 4, 1));
+        assert_eq!(app.old_selection(), None);
+        app.on_key(ctrl('c'));
+        assert!(app.quit);
+    }
+
+    /// A line wider than the pane can only be selected to its end if dragging
+    /// past the pane's edge scrolls the view, and keeps scrolling while the
+    /// button is held there — the terminal reports no drag that stands still.
+    #[test]
+    fn a_drag_held_past_the_edge_scrolls_until_the_line_ends() {
+        let long = "abcdefghijklmnopqrstuvwxyz0123456789ABCD\n";
+        let fixture = Fixture::new("edge-scroll", long, "x\n");
+        let mut app = fixture.app();
+        app.viewport_height = 8;
+        // Inner width 18, gutter "1 " — 16 text columns for a 40-char line.
+        app.panes[Pane::Old as usize] = Rect::new(0, 0, 20, 10);
+        app.panes[Pane::New as usize] = Rect::new(20, 0, 20, 10);
+        let mouse = |kind, column, row| MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        };
+        app.on_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 3, 1));
+        // Into the New pane, past the Old pane's right border.
+        app.on_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 25, 1));
+        assert_eq!(
+            app.hscroll, HSCROLL_STEP as usize,
+            "one step per drag event"
+        );
+        assert!(
+            app.dragging_past_edge(),
+            "held past the edge, so keep going"
+        );
+        // The head reaches just past the last visible column, not the line end.
+        assert_eq!(
+            app.old_selection().unwrap().1,
+            (0, 16 + HSCROLL_STEP as usize)
+        );
+
+        let mut ticks = 0;
+        while app.dragging_past_edge() {
+            app.autoscroll();
+            ticks += 1;
+            assert!(ticks < 100, "must stop once the view cannot move");
+        }
+        assert_eq!(app.hscroll, 24, "40 columns of text, 16 visible");
+        assert_eq!(app.old_selected_text().as_deref(), Some(&long[..40]));
+
+        // Back inside the pane: no more ticking.
+        app.on_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 10, 1));
+        assert!(!app.dragging_past_edge());
+        app.on_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 10, 1));
+        assert_eq!(app.edge_drag, None);
+    }
+
+    /// The editor pane has a cursor, and the frame's clamp widens the view by
+    /// one column for it at the right limit; the tick must not read that as
+    /// room to keep going.
+    #[test]
+    fn a_held_drag_in_the_editor_stops_at_the_limit_despite_the_clamp() {
+        let long = "abcdefghijklmnopqrstuvwxyz0123456789ABCD\n";
+        let fixture = Fixture::new("edge-scroll-new", "x\n", long);
+        let mut app = fixture.app();
+        app.viewport_height = 8;
+        app.panes[Pane::Old as usize] = Rect::new(0, 0, 20, 10);
+        app.panes[Pane::New as usize] = Rect::new(20, 0, 20, 10);
+        let mouse = |kind, column, row| MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        };
+        app.on_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 23, 1));
+        app.on_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 39, 1));
+        assert!(app.dragging_past_edge());
+        let mut ticks = 0;
+        while app.dragging_past_edge() {
+            app.autoscroll();
+            app.clamp_scroll();
+            ticks += 1;
+            assert!(ticks < 100, "must stop once the view cannot move");
+        }
+        assert_eq!(
+            app.buffer().unwrap().selected_text().as_deref(),
+            Some(&long[..40])
+        );
+
+        // Focus moving mid-drag does not move the selection to another pane.
+        app.on_key(key(KeyCode::Esc));
+        app.on_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 30, 1));
+        assert_eq!(app.old_selection(), None);
+        app.on_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 30, 1));
+    }
+
+    /// Right-click on the file list is "take this path": copied, confirmed in
+    /// the footer, and the confirmation fades on its own — without moving the
+    /// selection, which is what a left click is for.
+    #[test]
+    fn right_click_copies_a_listed_path_and_the_notice_fades() {
+        let fixture = Fixture::new("copy-path", "a\n", "b\n");
+        let mut app = fixture.app();
+        app.panes[Pane::Files as usize] = Rect::new(0, 0, 20, 10);
+        app.panes[Pane::Old as usize] = Rect::new(20, 0, 20, 10);
+        app.panes[Pane::New as usize] = Rect::new(40, 0, 20, 10);
+        let selected = app.file_state.selected();
+        let path = app.files[0].path.display().to_string();
+
+        app.on_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Right),
+            column: 5,
+            row: 1,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(
+            app.notice.as_deref(),
+            Some(format!("Copied {path}").as_str())
+        );
+        assert_eq!(app.file_state.selected(), selected, "selection untouched");
+        let wait = app.next_tick().expect("a fade is scheduled");
+        assert!(wait <= NOTICE_TTL && wait > NOTICE_TTL / 2);
+
+        // Not due yet: a tick leaves it. Due: a tick clears it.
+        app.tick();
+        assert!(app.notice.is_some());
+        app.notice_until = Some(Instant::now());
+        app.tick();
+        assert_eq!(app.notice, None);
+        assert_eq!(app.next_tick(), None, "idle again");
+
+        // Right-click on a diff pane copies nothing.
+        app.on_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Right),
+            column: 30,
+            row: 1,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(app.notice, None);
     }
 
     #[test]
