@@ -8,6 +8,11 @@
 # nobody can install. Everything runs with your own credentials; the release
 # workflow needs no token that can write to another repository.
 #
+# It stops at the tap's commit and prints the push for you to run. Pushing is
+# where you say yes — the SSH key is not in an agent, so every push asks for
+# its passphrase — and this one would land minutes after the last, past a
+# `gh run watch` the prompt does not always survive.
+#
 # What it will not do: re-run a tag that already exists. The tarballs are
 # rebuilt with new mtimes, so their checksums change under the same URLs, and
 # the formula already in the tap would refuse to install them. A mistake in a
@@ -100,8 +105,9 @@ fi
 
 git -C "$tapdir" add Formula/difv.rb
 git -C "$tapdir" commit -q -m "difv $version"
-git -C "$tapdir" push -q origin HEAD
 
-say "released $tag"
+say "released $tag — the tap is committed, and yours to push"
+echo "  git -C $tapdir push origin HEAD"
+echo
 echo "  https://github.com/$REPO/releases/tag/$tag"
-echo "  brew upgrade difv    # or: brew install $TAP/difv"
+echo "  brew upgrade difv    # once that push lands"
