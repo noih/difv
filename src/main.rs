@@ -151,11 +151,12 @@ fn main() -> Result<()> {
             println!(
                 "difv {}\n{}\n\n\
                  Usage: difv [PATH]\n\n\
-                 Run it inside a Git repository, or give it a path to one: `HEAD` on\n\
-                 the left, the working tree on the right, and the right side is\n\
-                 editable. A directory picks the repository — the whole repository's\n\
-                 changes are listed either way, so a subdirectory does not narrow\n\
-                 them. A file picks the repository too, and starts on that file.\n\
+                 Run it inside a Git repository, or give it a path to one. A\n\
+                 directory picks the repository; a file picks the repository and\n\
+                 opens on that file. Either way the whole repository's changes are\n\
+                 listed, so a subdirectory does not narrow them.\n\n\
+                 \x20 -h, --help       this\n\
+                 \x20 -V, --version    the version\n\n\
                  Press `?` inside for the keys, `,` for the settings.\n\n\
                  Config: $XDG_CONFIG_HOME/difv/config.toml, or ~/.config/difv/config.toml\n\
                  DIFV_HOME moves it: $DIFV_HOME/config.toml instead.",
