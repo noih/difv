@@ -67,7 +67,15 @@ for _ in $(seq 1 30); do
 done
 [[ -n $run ]] || die "the release workflow did not start — check Actions on $REPO"
 gh run watch --repo "$REPO" "$run" --exit-status
-gh release view "$tag" --repo "$REPO" --json assets --jq '.assets[].name' | grep -qx difv.rb \
+
+# Asked for over the public download URL rather than through `gh release view`.
+# The releases REST endpoint needs a token permission the release itself does
+# not: a fine-grained PAT without it answers 403, which `gh` reports as
+# "release not found" — a green workflow and a released tag, called a failure
+# by the one check meant to confirm them. A published release's assets are
+# public, and that is what the tap is about to fetch anyway.
+formula=https://github.com/$REPO/releases/download/$tag/difv.rb
+curl -fsIL -o /dev/null "$formula" \
   || die "the release has no difv.rb — the formula step failed"
 
 # --- tap ---------------------------------------------------------------------
@@ -81,7 +89,7 @@ else
   tapdir=$(mktemp -d)
   git clone -q "$TAP_REPO" "$tapdir"
 fi
-gh release download "$tag" --repo "$REPO" --pattern difv.rb --dir "$tapdir/Formula" --clobber
+curl -fsSL "$formula" -o "$tapdir/Formula/difv.rb"
 
 if command -v brew >/dev/null; then
   # The same checks the tap's test-bot runs, so a red build is caught here.
