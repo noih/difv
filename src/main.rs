@@ -85,7 +85,7 @@ fn main() -> Result<()> {
     }
     let mut app = App::new(config)?;
 
-    refuse_suspension();
+    refuse_signals();
     // Ratatui's own hook restores raw mode and the alternate screen, but knows
     // nothing about the modes difv turns on. Installed first so it still runs.
     let previous = std::panic::take_hook();
@@ -116,16 +116,18 @@ fn leave_modes() {
     let _ = execute!(stdout(), DisableBracketedPaste, DisableMouseCapture);
 }
 
-/// `Ctrl+Z` is undo inside difv, and raw mode already stops the terminal driver
-/// from turning it into a signal. Some terminals send `SIGTSTP` themselves
-/// anyway, which stops difv before it can turn mouse reporting back off and
-/// leaves the shell being written to on every mouse move. Since suspension is
-/// not something difv offers, refusing the signal is what makes the key mean
-/// one thing everywhere.
-fn refuse_suspension() {
+/// `Ctrl+C` is copy and `Ctrl+Z` is undo inside difv, and raw mode already
+/// stops the terminal driver from turning either into a signal. Some terminals
+/// send `SIGINT` or `SIGTSTP` themselves anyway, which kills or stops difv
+/// before it can turn mouse reporting back off and leaves the shell being
+/// written to on every mouse move. Since neither interruption nor suspension
+/// is something difv offers — `q` quits, and `SIGTERM` still works — refusing
+/// the signals is what makes the keys mean one thing everywhere.
+fn refuse_signals() {
     // SAFETY: setting a disposition to SIG_IGN is async-signal-safe and touches
     // no state of ours.
     unsafe {
+        libc::signal(libc::SIGINT, libc::SIG_IGN);
         libc::signal(libc::SIGTSTP, libc::SIG_IGN);
     }
 }
