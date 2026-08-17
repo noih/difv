@@ -7,7 +7,9 @@ mod git;
 mod settings;
 mod ui;
 
+use std::ffi::OsString;
 use std::io::stdout;
+use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use crossterm::event::{
@@ -19,6 +21,7 @@ use crossterm::style::Print;
 
 use app::App;
 use config::Config;
+use git::Repo;
 
 /// Mouse reporting, asked for by hand rather than through `EnableMouseCapture`,
 /// which also turns on any-motion tracking (`?1003h`) — an event for every cell
@@ -39,45 +42,145 @@ use config::Config;
 /// clicking and no scrolling at all.
 const MOUSE_ON: &str = "\x1b[?1000h\x1b[?1002h\x1b[?1015h\x1b[?1006h";
 
-/// difv takes no arguments — it always compares `HEAD` against the working
-/// tree — but a command line tool that cannot say what version it is cannot be
-/// packaged or reported against.
-fn answer_flags() -> bool {
-    let Some(flag) = std::env::args().nth(1) else {
-        return false;
+/// difv always compares `HEAD` against the working tree, so the only thing a
+/// command line has to say is which repository — and, at most, which file to
+/// start on. Parsing is kept away from the filesystem and the terminal so it
+/// can be tested as the table of outcomes it is.
+#[derive(Debug, PartialEq, Eq)]
+enum Args {
+    Version,
+    Help,
+    Open(PathBuf),
+    Error(String),
+}
+
+/// Arguments are taken as `OsString`, not `String`: a path is what this takes
+/// now, and a path is not required to be UTF-8 anywhere difv runs. Refusing
+/// one is fine; panicking inside `std::env::args()` on a file name the user
+/// can see in their own shell is not.
+fn parse_args<I: IntoIterator<Item = OsString>>(args: I) -> Args {
+    let mut args = args.into_iter();
+    let Some(first) = args.next() else {
+        return Args::Open(PathBuf::from("."));
     };
-    match flag.as_str() {
-        "-V" | "--version" => println!("difv {}", env!("CARGO_PKG_VERSION")),
-        "-h" | "--help" => println!(
-            "difv {}\n{}\n\n\
-             Usage: difv\n\n\
-             Run it inside a Git repository. It takes no arguments: `HEAD` on the\n\
-             left, the working tree on the right, and the right side is editable.\n\
-             Press `?` inside for the keys, `,` for the settings.\n\n\
-             Config: $XDG_CONFIG_HOME/difv/config.toml, or ~/.config/difv/config.toml\n\
-             DIFV_HOME moves it: $DIFV_HOME/config.toml instead.",
-            env!("CARGO_PKG_VERSION"),
-            env!("CARGO_PKG_DESCRIPTION"),
-        ),
-        other => {
-            eprintln!("difv: unknown argument `{other}` — try `difv --help`");
-            std::process::exit(2);
-        }
+    // A leading `-` is what separates a flag from a path, so a file whose name
+    // starts with one is reached as `./-name` — the usual escape hatch, and
+    // cheaper than a `--` separator nobody will type. A name difv cannot decode
+    // cannot be a flag either, so it goes down the path side untouched.
+    if let Some(text) = first.to_str()
+        && text.starts_with('-')
+    {
+        return match text {
+            "-V" | "--version" => Args::Version,
+            "-h" | "--help" => Args::Help,
+            other => Args::Error(format!("unknown argument `{other}` — try `difv --help`")),
+        };
     }
-    true
+    if first.is_empty() {
+        return Args::Error("empty path — try `difv --help`".to_string());
+    }
+    if args.next().is_some() {
+        return Args::Error("at most one path — try `difv --help`".to_string());
+    }
+    Args::Open(PathBuf::from(first))
+}
+
+/// Where difv starts: the path as it was typed, kept for what difv says about
+/// it; the directory to discover the repository from; and the file to select
+/// once the repository is known.
+struct Target {
+    typed: PathBuf,
+    start: PathBuf,
+    file: Option<PathBuf>,
+}
+
+/// Anything that is not a directory is taken as a file, including a path that
+/// is not on disk at all: a file git reports as deleted is one of the things
+/// difv is most often opened on, and it is only the changed-file list that can
+/// tell that case from a typo. Whether the path exists is settled there, once
+/// the list is in hand — and until then the walk up to a directory that does
+/// exist is what keeps a deletion that took the whole directory openable.
+fn classify(typed: PathBuf) -> Target {
+    if typed.is_dir() {
+        return Target {
+            start: typed.clone(),
+            typed,
+            file: None,
+        };
+    }
+    let start = git::nearest_existing_dir(&typed)
+        .map(|(dir, _)| dir)
+        .unwrap_or(Path::new("."))
+        .to_path_buf();
+    Target {
+        start,
+        file: Some(typed.clone()),
+        typed,
+    }
+}
+
+/// The repository the command line asked for. Discovery is what fails when the
+/// path is wrong, but the message has to name the path the user typed rather
+/// than whichever ancestor the walk above stopped at — and a path that is not
+/// there at all is a different mistake from one that is outside a repository.
+fn open_repo(target: &Target) -> Result<Repo, String> {
+    Repo::discover(&target.start).map_err(|_| {
+        let path = target.typed.display();
+        match (target.typed.exists(), target.typed == Path::new(".")) {
+            (_, true) => "not a git repository".to_string(),
+            (true, _) => format!("not a git repository: {path}"),
+            (false, _) => format!("no such path: {path}"),
+        }
+    })
+}
+
+/// Everything difv can refuse before the terminal is touched says so the same
+/// way: `difv: <what went wrong>`, and exit 2.
+fn refuse(message: &str) -> ! {
+    eprintln!("difv: {message}");
+    std::process::exit(2);
 }
 
 fn main() -> Result<()> {
-    if answer_flags() {
-        return Ok(());
-    }
+    let target = match parse_args(std::env::args_os().skip(1)) {
+        Args::Version => {
+            println!("difv {}", env!("CARGO_PKG_VERSION"));
+            return Ok(());
+        }
+        Args::Help => {
+            println!(
+                "difv {}\n{}\n\n\
+                 Usage: difv [PATH]\n\n\
+                 Run it inside a Git repository, or give it a path to one: `HEAD` on\n\
+                 the left, the working tree on the right, and the right side is\n\
+                 editable. A directory picks the repository — the whole repository's\n\
+                 changes are listed either way, so a subdirectory does not narrow\n\
+                 them. A file picks the repository too, and starts on that file.\n\
+                 Press `?` inside for the keys, `,` for the settings.\n\n\
+                 Config: $XDG_CONFIG_HOME/difv/config.toml, or ~/.config/difv/config.toml\n\
+                 DIFV_HOME moves it: $DIFV_HOME/config.toml instead.",
+                env!("CARGO_PKG_VERSION"),
+                env!("CARGO_PKG_DESCRIPTION"),
+            );
+            return Ok(());
+        }
+        Args::Error(message) => refuse(&message),
+        Args::Open(path) => classify(path),
+    };
+    let repo = match open_repo(&target) {
+        Ok(repo) => repo,
+        Err(message) => refuse(&message),
+    };
     // Both of these run before the alternate screen so their output lands on a
     // normal terminal rather than a torn-down TUI.
     let (config, warnings) = Config::load();
     for warning in &warnings {
         eprintln!("difv: {warning}");
     }
-    let mut app = App::new(config)?;
+    let mut app = match App::new(config, repo, target.file.as_deref()) {
+        Ok(app) => app,
+        Err(err) => refuse(&err.to_string()),
+    };
 
     refuse_signals();
     // Ratatui's own hook restores raw mode and the alternate screen, but knows
@@ -187,6 +290,106 @@ fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn parse(args: &[&str]) -> Args {
+        parse_args(args.iter().map(OsString::from))
+    }
+
+    /// One optional path, and everything a `-` starts still means what it did.
+    #[test]
+    fn the_command_line_is_at_most_one_path() {
+        assert_eq!(parse(&[]), Args::Open(PathBuf::from(".")));
+        assert_eq!(parse(&["-V"]), Args::Version);
+        assert_eq!(parse(&["--version"]), Args::Version);
+        assert_eq!(parse(&["-h"]), Args::Help);
+        assert_eq!(parse(&["--help"]), Args::Help);
+        assert_eq!(
+            parse(&["src/auth.ts"]),
+            Args::Open(PathBuf::from("src/auth.ts"))
+        );
+        assert_eq!(
+            parse(&["/abs/repo"]),
+            Args::Open(PathBuf::from("/abs/repo"))
+        );
+
+        let Args::Error(unknown) = parse(&["--frobnicate"]) else {
+            panic!("an unknown flag is refused");
+        };
+        assert!(
+            unknown.contains("--frobnicate") && unknown.contains("--help"),
+            "{unknown}"
+        );
+
+        let Args::Error(two) = parse(&["src", "tests"]) else {
+            panic!("a second path is refused");
+        };
+        assert!(two.contains("at most one path"), "{two}");
+
+        let Args::Error(empty) = parse(&[""]) else {
+            panic!("an empty path is refused");
+        };
+        assert!(empty.contains("empty path"), "{empty}");
+    }
+
+    /// A path difv cannot decode is a path all the same — refusing it is fine,
+    /// panicking inside the argument iterator is not.
+    #[test]
+    #[cfg(unix)]
+    fn an_undecodable_path_is_a_path() {
+        use std::os::unix::ffi::OsStringExt;
+        let bad = OsString::from_vec(vec![0xff, 0xfe, b'x']);
+        assert_eq!(parse_args([bad.clone()]), Args::Open(PathBuf::from(bad)));
+    }
+
+    /// A deletion that took the directory with it leaves neither the file nor
+    /// its parent to start from, and that is exactly when the file is worth
+    /// opening by name. The walk has to reach the repository above them.
+    #[test]
+    fn classification_walks_up_to_a_directory_that_exists() {
+        let fixture = app::tests::Fixture::new("classify", "a\n", "b\n");
+        let root = fixture.dir();
+
+        let dir = classify(root.to_path_buf());
+        assert_eq!(dir.start, root, "a directory is its own starting point");
+        assert_eq!(dir.file, None);
+
+        let file = classify(root.join("file.txt"));
+        assert_eq!(file.start, root, "a file starts from its directory");
+        assert_eq!(file.file.as_deref(), Some(root.join("file.txt").as_path()));
+
+        let gone = classify(root.join("src/deep/auth.ts"));
+        assert_eq!(gone.start, root, "past two directories that are not there");
+        assert_eq!(
+            gone.file.as_deref(),
+            Some(root.join("src/deep/auth.ts").as_path())
+        );
+    }
+
+    /// Whatever the walk had to settle for, the refusal names the path the
+    /// user typed — and says which of the two mistakes it was.
+    #[test]
+    fn a_refusal_names_the_path_that_was_typed() {
+        let outside = std::env::temp_dir().join(format!("difv-refuse-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&outside);
+        std::fs::create_dir_all(&outside).unwrap();
+
+        let missing = classify(outside.join("nope/deeper.txt"));
+        let Err(message) = open_repo(&missing) else {
+            panic!("a path outside a repository is refused");
+        };
+        assert!(message.starts_with("no such path: "), "{message}");
+        assert!(message.ends_with("nope/deeper.txt"), "{message}");
+
+        let there = classify(outside.clone());
+        let Err(message) = open_repo(&there) else {
+            panic!("a directory outside a repository is refused");
+        };
+        assert_eq!(
+            message,
+            format!("not a git repository: {}", outside.display())
+        );
+        let _ = std::fs::remove_dir_all(&outside);
+    }
 
     /// Enabling any-motion tracking and turning it back off cost every
     /// xterm.js-based terminal its mouse entirely, because a reset there means

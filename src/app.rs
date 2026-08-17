@@ -1,8 +1,8 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::{Position, Rect};
 use ratatui::widgets::ListState;
@@ -123,15 +123,39 @@ const AUTOSCROLL_TICK: Duration = Duration::from_millis(50);
 const NOTICE_TTL: Duration = Duration::from_secs(2);
 
 impl App {
-    pub fn new(config: Config) -> Result<Self> {
-        let repo = Repo::discover()?;
+    pub fn new(config: Config, repo: Repo, select: Option<&Path>) -> Result<Self> {
         let files = repo.changed_files()?;
         let remember = config.remember_layout;
         let mut app = Self::with(repo, files, config);
         if remember && let Some(weights) = crate::config::load_layout() {
             app.weights = weights;
         }
+        if let Some(path) = select {
+            app.select_path(path)?;
+        }
         Ok(app)
+    }
+
+    /// Start on the file the command line named. A file with no changes is not
+    /// an error — the rest of the list is still what the user came to see — so
+    /// it says so in the footer and leaves the selection where it was. A path
+    /// that is neither a change nor on disk is a typo, and refusing it here is
+    /// the only place that can tell it from a file git reports as deleted,
+    /// which is not on disk either.
+    pub fn select_path(&mut self, path: &Path) -> Result<()> {
+        let index = self
+            .repo
+            .relative(path)
+            .and_then(|rel| self.files.iter().position(|f| f.path == rel));
+        match index {
+            Some(index) => self.select(index),
+            None if !path.exists() => bail!("no such path: {}", path.display()),
+            None => {
+                self.notice = Some(format!("{} has no changes", path.display()));
+                self.notice_until = Some(Instant::now() + NOTICE_TTL);
+            }
+        }
+        Ok(())
     }
 
     /// Key handling is a pure state machine, so tests build an `App` directly
@@ -1350,6 +1374,10 @@ pub mod tests {
             Self { dir }
         }
 
+        pub fn dir(&self) -> &std::path::Path {
+            &self.dir
+        }
+
         pub fn app(&self) -> App {
             let repo = Repo::at(self.dir.clone());
             let files = repo.changed_files().unwrap();
@@ -2089,6 +2117,118 @@ pub mod tests {
         app.on_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 30, 1));
         assert_eq!(app.old_selection(), None);
         app.on_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 30, 1));
+    }
+
+    /// A file on the command line is "start here", so it has to reach past the
+    /// first row. The relative form of a path is `Repo::relative`'s to get
+    /// right, and is tested there.
+    #[test]
+    fn a_file_argument_starts_on_that_file() {
+        let fixture = Fixture::new("open-file", "a\n", "b\n");
+        std::fs::write(fixture.dir().join("zz.txt"), "new\n").unwrap();
+        let mut app = fixture.app();
+        assert_eq!(app.files.len(), 2, "file.txt and zz.txt");
+
+        app.select_path(&fixture.dir().join("zz.txt")).unwrap();
+        assert_eq!(
+            app.selected_file().map(|f| f.path.display().to_string()),
+            Some("zz.txt".to_string())
+        );
+        assert_eq!(app.notice, None);
+    }
+
+    /// The file the reader most wants to open by name is often one that is no
+    /// longer on disk, so the path is resolved through its directory rather
+    /// than through itself.
+    #[test]
+    fn a_deleted_file_can_be_named_on_the_command_line() {
+        let fixture = Fixture::new("open-deleted", "a\n", "b\n");
+        std::fs::write(fixture.dir().join("aaa.txt"), "new\n").unwrap();
+        std::fs::remove_file(fixture.dir().join("file.txt")).unwrap();
+        let mut app = fixture.app();
+
+        app.select_path(&fixture.dir().join("file.txt")).unwrap();
+        let selected = app.selected_file().expect("a file is selected");
+        assert_eq!(selected.path.display().to_string(), "file.txt");
+        assert_eq!(selected.status, crate::git::Status::Deleted);
+
+        // A path that is neither a change nor on disk is a typo, and the only
+        // thing that tells it from the deleted file above is the list.
+        let Err(err) = app.select_path(&fixture.dir().join("sub/typo.txt")) else {
+            panic!("a path that does not exist is refused");
+        };
+        assert!(err.to_string().contains("no such path"), "{err}");
+        assert!(err.to_string().contains("typo.txt"), "{err}");
+    }
+
+    /// `git rm -r src` takes the directory too, so neither the file nor its
+    /// parent is there to resolve against — which is no reason for the file to
+    /// stop being openable by name.
+    #[test]
+    fn a_deleted_directory_does_not_hide_the_files_that_were_in_it() {
+        let fixture = Fixture::new("open-deleted-dir", "a\n", "b\n");
+        std::fs::create_dir_all(fixture.dir().join("src/deep")).unwrap();
+        std::fs::write(fixture.dir().join("src/deep/auth.ts"), "old\n").unwrap();
+        fixture.git(&["add", "src/deep/auth.ts"]);
+        fixture.git(&["commit", "-qm", "add src"]);
+        std::fs::remove_dir_all(fixture.dir().join("src")).unwrap();
+        let mut app = fixture.app();
+
+        app.select_path(&fixture.dir().join("src/deep/auth.ts"))
+            .unwrap();
+        let selected = app.selected_file().expect("a file is selected");
+        assert_eq!(selected.path.display().to_string(), "src/deep/auth.ts");
+        assert_eq!(selected.status, crate::git::Status::Deleted);
+    }
+
+    /// Naming a file with nothing to show is not worth refusing to start over:
+    /// the rest of the list is still what the reader came for.
+    #[test]
+    fn a_file_with_no_changes_only_notices() {
+        let fixture = Fixture::new("open-unchanged", "a\n", "b\n");
+        let mut app = fixture.app();
+        let selected = app.file_state.selected();
+
+        let path = fixture.dir().join("untouched.txt");
+        std::fs::write(&path, "same as ever\n").unwrap();
+        // Untracked would make it a change; committing only it is what leaves a
+        // file with nothing to show, next to a `file.txt` that still has one.
+        fixture.git(&["add", "untouched.txt"]);
+        fixture.git(&["commit", "-qm", "add untouched"]);
+        app.refresh();
+        assert!(
+            !app.files.iter().any(|f| f.path.ends_with("untouched.txt")),
+            "the file has no changes: {:?}",
+            app.files
+        );
+
+        app.select_path(&path).unwrap();
+        assert_eq!(
+            app.notice.as_deref(),
+            Some(format!("{} has no changes", path.display()).as_str())
+        );
+        assert_eq!(app.file_state.selected(), selected, "selection untouched");
+        assert!(app.next_tick().is_some(), "the notice fades on its own");
+    }
+
+    /// The same path through a repository with nothing to list at all, where
+    /// there is no row for the selection to stay on.
+    #[test]
+    fn a_clean_repository_notices_without_a_row_to_select() {
+        let fixture = Fixture::new("open-clean", "a\n", "b\n");
+        let repo = Repo::at(fixture.dir().to_path_buf());
+        let mut app = App::with(repo, Vec::new(), Config::default());
+        assert_eq!(app.file_state.selected(), None);
+
+        app.select_path(&fixture.dir().join("file.txt")).unwrap();
+        assert!(
+            app.notice
+                .as_deref()
+                .is_some_and(|n| n.ends_with("has no changes")),
+            "{:?}",
+            app.notice
+        );
+        assert_eq!(app.file_state.selected(), None);
     }
 
     /// Right-click on the file list is "take this path": copied, confirmed in

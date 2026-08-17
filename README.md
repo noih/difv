@@ -33,7 +33,10 @@ Apple Silicon macOS and Linux. `git` has to be on your `PATH`.
 
 ## Use
 
-Run `difv` inside a Git repository. That is the whole command line.
+Run `difv` inside a Git repository, or `difv <path>` to point it at one you are
+not standing in. A directory only says which repository — the list is the whole
+repository's changes either way — and a file says which repository *and* which
+file to open on.
 
 - Click, scroll, or arrow around; drag a border to resize; drag to select and
   `Ctrl+C` to copy from either side; right-click a file to copy its path. The
