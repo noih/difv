@@ -3,9 +3,10 @@
 Review and tweak your Git changes side by side, in the terminal.
 
 Three panes: your changed files, `HEAD`, and the working tree. The working-tree
-pane is an editor — fix the small things while you review, save, move on. Built
-to be used while the files are still moving under it: another editor, a
-formatter, a rebase.
+pane is an editor — fix the small things while you review, save, move on. Its
+right edge is a ruler of the whole file, so every change is on screen even when
+the lines are not. Built to be used while the files are still moving under it:
+another editor, a formatter, a rebase.
 
 ```
 ┌ Changes (4) ────────┬ HEAD / Before ──────────┬ Working Tree / Current ─────┐

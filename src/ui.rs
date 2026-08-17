@@ -6,7 +6,7 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragra
 use unicode_width::UnicodeWidthChar;
 
 use crate::app::{App, Pane};
-use crate::diff::RowKind;
+use crate::diff::{DiffRow, RowKind};
 use crate::git::Status;
 use crate::settings;
 
@@ -15,6 +15,15 @@ const BG_ADDED: Color = Color::Rgb(0x1c, 0x33, 0x22);
 const BG_PHANTOM: Color = Color::Rgb(0x1a, 0x1a, 0x1c);
 const BG_SELECTION: Color = Color::Rgb(0x2d, 0x44, 0x6b);
 const FG_GUTTER: Color = Color::Rgb(0x6b, 0x6b, 0x76);
+/// The band behind the ruler marks, saying which rows are on screen. Bright
+/// enough to find against a near-black terminal without a track behind it to
+/// be read against, dark enough not to be mistaken for a mark: the marks are
+/// coloured, this is only lighter.
+const BG_RULER_VIEW: Color = Color::Rgb(0x4d, 0x56, 0x70);
+
+/// Cells the viewport band never goes below, however small a share of the file
+/// is on screen.
+const MIN_THUMB: usize = 2;
 
 /// Unsaved edits, and a file rewritten under unsaved edits. Both are ASCII on
 /// purpose: a round dot reads better, but `●` and the rest of its neighbourhood
@@ -51,6 +60,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     }
     draw_side(frame, app, old, Pane::Old);
     draw_side(frame, app, new, Pane::New);
+    // One ruler, not two: the panes share a scroll position, so a second would
+    // only repeat the first.
+    draw_ruler(frame, app, new);
     draw_cursor(frame, app, new);
     draw_settings(frame, app, body);
     draw_help(frame, app, body);
@@ -352,6 +364,145 @@ fn draw_side(frame: &mut Frame, app: &App, area: Rect, side: Pane) {
 
     let widget = Paragraph::new(lines).block(block(&title, app.focus == side));
     frame.render_widget(widget, area);
+}
+
+/// What one ruler cell says about the rows it stands for. The three are the
+/// Changes pane's three statuses, because they are the same three facts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mark {
+    Deleted,
+    Added,
+    Modified,
+}
+
+impl Mark {
+    /// Bars, not text, so these are backgrounds — muted enough to sit next to
+    /// the panes without shouting, saturated enough to be findable at a
+    /// glance. The named `Color::Red` and friends the file list uses are for
+    /// glyphs, and read as warnings at full width.
+    fn color(self) -> Color {
+        match self {
+            Mark::Deleted => Color::Rgb(0x8f, 0x3d, 0x43),
+            Mark::Added => Color::Rgb(0x3f, 0x7d, 0x52),
+            Mark::Modified => Color::Rgb(0x93, 0x78, 0x30),
+        }
+    }
+
+    /// The same mark, inside the band. A mark is a background and so is the
+    /// band, so they cannot both be drawn in that cell — instead the band
+    /// brightens what it covers. One rule for the whole ruler: what is on
+    /// screen is lighter. The hue is untouched, so a mark is still red, green
+    /// or yellow first and on-screen second.
+    fn lit(self) -> Color {
+        match self {
+            Mark::Deleted => Color::Rgb(0xb5, 0x60, 0x66),
+            Mark::Added => Color::Rgb(0x6b, 0xa0, 0x7a),
+            Mark::Modified => Color::Rgb(0xc4, 0xa2, 0x4a),
+        }
+    }
+}
+
+/// Rows per ruler cell, as a denominator. A diff shorter than the ruler is
+/// laid out one row to one cell rather than stretched over the whole column,
+/// so a mark sits beside the row it stands for while there is room for that to
+/// be true.
+pub fn ruler_span(rows: usize, height: usize) -> usize {
+    rows.max(height)
+}
+
+/// The whole diff, one entry per cell of the ruler. A cell takes the union of
+/// the rows it covers rather than the first of them: a lone deletion inside a
+/// long insertion is exactly what a reader wants an overview to have kept, and
+/// a cell holding both kinds cannot honestly be either.
+fn ruler_marks(rows: &[DiffRow], height: usize) -> Vec<Option<Mark>> {
+    let mut marks = vec![None; height];
+    if height == 0 {
+        return marks;
+    }
+    let span = ruler_span(rows.len(), height);
+    for (index, row) in rows.iter().enumerate() {
+        let mark = match row.kind {
+            RowKind::Equal => continue,
+            RowKind::Delete => Mark::Deleted,
+            RowKind::Insert => Mark::Added,
+            RowKind::Replace => Mark::Modified,
+        };
+        let cell = (index * height / span).min(height - 1);
+        marks[cell] = Some(match marks[cell] {
+            Some(seen) if seen != mark => Mark::Modified,
+            Some(seen) => seen,
+            None => mark,
+        });
+    }
+    marks
+}
+
+/// The cells the rows on screen fall in, which is the ruler's other job: difv
+/// has no scrollbar, so this band is the only thing that says how far through
+/// a file the view is.
+pub fn ruler_band(
+    rows: usize,
+    height: usize,
+    scroll: usize,
+    viewport: usize,
+) -> std::ops::Range<usize> {
+    if height == 0 || rows == 0 {
+        return 0..0;
+    }
+    let span = ruler_span(rows, height);
+    // The part of the column that stands for anything: with a diff shorter than
+    // the ruler, the cells past the last row are not a place the view can be.
+    let used = (rows * height).div_ceil(span).clamp(1, height);
+    // A fixed length, positioned by the scroll — not each end rounded to a cell
+    // on its own, which is how a thumb ends up growing and shrinking by a cell
+    // as it travels: the two roundings drift in and out of phase.
+    //
+    // A floor under it, because proportion alone shrinks toward nothing on a
+    // long enough file: a ten-thousand-line diff on a forty-row pane is a
+    // single cell, which reads as a stray mark rather than as where you are.
+    // Pressing the ruler jumps to the pointer rather than grabbing the thumb,
+    // so this is about seeing it, not hitting it — and on a ruler with fewer
+    // cells than the floor, the floor is the ruler.
+    let thumb = (viewport * height)
+        .div_ceil(span)
+        .clamp(MIN_THUMB.min(used), used);
+    // Positioned by the row it starts on, the way the marks are, and not by the
+    // fraction of the scroll travelled: those are two coordinate systems, and a
+    // thumb placed by the second one drifts off the cells the first one marks —
+    // a change on screen drawn dim while the cell above it is lit. Clamping is
+    // what still puts the end of the file at the end of the ruler.
+    let start = (scroll * height / span).min(used - thumb);
+    start..start + thumb
+}
+
+/// The whole diff on the Current pane's right border: marks over a band saying
+/// which rows are on screen. Drawn after the pane, into the border cells it
+/// already had, so the text area keeps every column it had before.
+fn draw_ruler(frame: &mut Frame, app: &App, area: Rect) {
+    let height = area.height.saturating_sub(2) as usize;
+    if height == 0 || area.width == 0 {
+        return;
+    }
+    let marks = ruler_marks(&app.diff.rows, height);
+    let band = ruler_band(app.diff.rows.len(), height, app.scroll, app.viewport_height);
+    let x = area.x + area.width - 1;
+    let buffer = frame.buffer_mut();
+    for (index, mark) in marks.iter().enumerate() {
+        let cell = &mut buffer[(x, area.y + 1 + index as u16)];
+        let banded = band.contains(&index);
+        match mark {
+            // A space rather than a block glyph: every block element is East
+            // Asian Ambiguous, so a CJK font would draw it two cells wide in a
+            // one-cell border and shunt the pane sideways.
+            Some(mark) if banded => cell.set_symbol(" ").set_bg(mark.lit()),
+            Some(mark) => cell.set_symbol(" ").set_bg(mark.color()),
+            // The band keeps the border's own glyph where it covers no change,
+            // so an unchanged stretch of the file still reads as the edge of a
+            // pane. Only a mark is worth breaking the line for.
+            None if banded => cell.set_bg(BG_RULER_VIEW),
+            None => cell,
+        };
+    }
 }
 
 /// Place the terminal cursor, which is what makes the Current pane read as an
@@ -792,6 +943,214 @@ mod tests {
         // block rather than stopping at the last character.
         let runs = segments("ab", 0, 6, 4, Some((0, 3)));
         assert_eq!(runs, vec![("ab ".to_string(), true)]);
+    }
+
+    /// The whole pass, on a real buffer: the marks land on the Current pane's
+    /// right border, in the right cells, and the band says where the view is.
+    #[test]
+    fn the_ruler_marks_the_border_of_the_current_pane() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let committed: Vec<String> = (0..100).map(|i| format!("line {i}\n")).collect();
+        let mut working = committed.clone();
+        working[4] = "changed\n".to_string();
+        working.insert(90, "added\n".to_string());
+        let fixture =
+            crate::app::tests::Fixture::new("ruler-render", &committed.concat(), &working.concat());
+
+        let mut app = fixture.app();
+        let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+
+        // The rightmost column of the body, and the rows between the corners.
+        let buffer = terminal.backend().buffer().clone();
+        let x = 79;
+        let ruler: Vec<Color> = (1..18).map(|y| buffer[(x, y)].bg).collect();
+
+        // The change near the top of the file is near the top of the ruler and
+        // the one near the end near the end. The view is at the top, so the
+        // first is inside the band and lit, the second outside it and not.
+        let at = |color: Color| ruler.iter().position(|bg| *bg == color);
+        assert_eq!(at(Mark::Modified.lit()), Some(0), "{ruler:?}");
+        assert_eq!(at(Mark::Modified.color()), None, "{ruler:?}");
+        assert_eq!(at(Mark::Added.color()), Some(15), "{ruler:?}");
+        // A banded cell with no mark is the band's own colour, and the bottom
+        // of the ruler is bare border.
+        assert_eq!(ruler[1], BG_RULER_VIEW, "{ruler:?}");
+        assert_eq!(*ruler.last().unwrap(), Color::Reset, "{ruler:?}");
+        assert_eq!(ruler.len(), 17, "one cell per row between the corners");
+        // The pane's own border is still a border everywhere else.
+        assert_eq!(buffer[(x, 0)].symbol(), "┐");
+        assert_eq!(buffer[(x, 18)].symbol(), "┘");
+        // Nothing was taken from the text: the pane to the left of the ruler
+        // still holds the diff.
+        assert!(terminal.backend().to_string().contains("changed"));
+    }
+
+    fn rows(kinds: &[RowKind]) -> Vec<DiffRow> {
+        kinds
+            .iter()
+            .map(|&kind| DiffRow {
+                old_line: None,
+                new_line: None,
+                kind,
+            })
+            .collect()
+    }
+
+    /// A cell stands for every row it covers, not the first of them: the whole
+    /// point of an overview is that a one-line deletion in the middle of a
+    /// rewrite is still on it.
+    #[test]
+    fn a_ruler_cell_takes_the_union_of_what_it_covers() {
+        let mut kinds = vec![RowKind::Equal; 100];
+        kinds[10] = RowKind::Delete;
+        for kind in &mut kinds[11..20] {
+            *kind = RowKind::Insert;
+        }
+        let marks = ruler_marks(&rows(&kinds), 10);
+
+        assert_eq!(marks[1], Some(Mark::Modified), "both kinds in one cell");
+        assert_eq!(marks[0], None);
+        assert_eq!(marks[2], None);
+
+        // Far enough apart to land in different cells, they keep their colours.
+        let mut kinds = vec![RowKind::Equal; 100];
+        kinds[5] = RowKind::Delete;
+        kinds[95] = RowKind::Insert;
+        let marks = ruler_marks(&rows(&kinds), 10);
+        assert_eq!(marks[0], Some(Mark::Deleted));
+        assert_eq!(marks[9], Some(Mark::Added));
+        assert!(marks[1..9].iter().all(Option::is_none), "{marks:?}");
+    }
+
+    #[test]
+    fn a_replaced_row_is_a_modification() {
+        let marks = ruler_marks(&rows(&[RowKind::Equal, RowKind::Replace]), 4);
+        assert_eq!(marks, vec![None, Some(Mark::Modified), None, None]);
+    }
+
+    /// A diff shorter than the ruler is laid out one row to one cell, so a mark
+    /// sits beside the row it stands for while there is room for that.
+    #[test]
+    fn a_short_diff_is_not_stretched_down_the_column() {
+        let kinds = [
+            RowKind::Equal,
+            RowKind::Insert,
+            RowKind::Equal,
+            RowKind::Delete,
+            RowKind::Equal,
+        ];
+        let marks = ruler_marks(&rows(&kinds), 40);
+
+        assert_eq!(marks[1], Some(Mark::Added));
+        assert_eq!(marks[3], Some(Mark::Deleted));
+        assert_eq!(marks.iter().filter(|m| m.is_some()).count(), 2);
+        assert!(marks[4..].iter().all(Option::is_none));
+    }
+
+    #[test]
+    fn an_unchanged_diff_leaves_the_border_alone() {
+        assert!(
+            ruler_marks(&rows(&[RowKind::Equal; 50]), 10)
+                .iter()
+                .all(Option::is_none)
+        );
+        assert!(ruler_marks(&rows(&[]), 4).iter().all(Option::is_none));
+        assert!(ruler_marks(&rows(&[RowKind::Insert]), 0).is_empty());
+    }
+
+    /// The band is difv's only answer to "how far through am I", so it has to
+    /// track the view and stop where the view stops.
+    #[test]
+    fn the_band_covers_the_rows_on_screen() {
+        assert_eq!(ruler_band(100, 10, 0, 20), 0..2);
+        assert_eq!(ruler_band(100, 10, 50, 20), 5..7);
+        // The end of the file puts the thumb against the end of the ruler.
+        assert_eq!(ruler_band(100, 10, 80, 20), 8..10);
+        // A diff shorter than the ruler is laid out one row to one cell, so the
+        // band covers the rows that exist rather than the whole column.
+        assert_eq!(ruler_band(5, 40, 0, 40), 0..5);
+        assert_eq!(ruler_band(5, 40, 1, 3), 1..4);
+        assert_eq!(ruler_band(0, 10, 0, 20), 0..0);
+        assert_eq!(ruler_band(100, 0, 0, 20), 0..0);
+    }
+
+    /// Proportion alone shrinks the band toward nothing on a long file, and a
+    /// one-cell band reads as a stray mark rather than as where the view is.
+    #[test]
+    fn the_band_has_a_floor_under_it() {
+        // Forty rows of ten thousand is a fifth of a cell, proportionally.
+        assert_eq!(ruler_band(10_000, 38, 0, 40).len(), MIN_THUMB);
+        assert_eq!(
+            ruler_band(10_000, 38, 9_960, 40),
+            36..38,
+            "still reaches the end"
+        );
+
+        // Every position on the way keeps the floor and stays inside the ruler.
+        for scroll in (0..=9_960).step_by(37) {
+            let band = ruler_band(10_000, 38, scroll, 40);
+            assert_eq!(band.len(), MIN_THUMB, "{scroll}");
+            assert!(band.end <= 38, "{scroll}: {band:?}");
+        }
+
+        // A ruler with fewer cells than the floor is all band, not more.
+        assert_eq!(ruler_band(500, 1, 0, 40), 0..1);
+    }
+
+    /// The band and the marks have to agree about where a row is, or a change
+    /// on screen is drawn dim while the cell above it is lit. They only do if
+    /// the band is positioned by the row it starts on, like the marks, rather
+    /// than by the fraction of the scroll travelled.
+    #[test]
+    fn the_band_holds_the_cells_the_marks_put_on_screen() {
+        // The case the two coordinate systems used to disagree on: the view is
+        // at row 600 of 1000, which is cell 6, and the band used to be 4..6.
+        assert!(ruler_band(1000, 10, 600, 10).contains(&6));
+
+        // A viewport can straddle one cell more than a fixed-length band can
+        // cover, so the two can be one cell apart — but never further, and the
+        // cell the first row on screen falls in is always banded.
+        for (rows, height, viewport) in [(1000, 10, 10), (208, 22, 22), (57, 17, 9), (41, 40, 12)] {
+            let span = ruler_span(rows, height);
+            for scroll in 0..=rows - viewport {
+                let band = ruler_band(rows, height, scroll, viewport);
+                let first = scroll * height / span;
+                let last = (scroll + viewport - 1) * height / span;
+                assert!(band.contains(&first), "{rows}/{height}/{scroll}: {band:?}");
+                assert!(
+                    last < band.end + 1,
+                    "{rows}/{height}/{scroll}: {band:?} misses {last} by more than a cell"
+                );
+            }
+        }
+    }
+
+    /// A thumb that grows and shrinks as it travels is the classic symptom of
+    /// rounding each of its ends separately. Its length is a property of how
+    /// much of the file is on screen, and that does not change while scrolling.
+    #[test]
+    fn the_thumb_keeps_its_length_wherever_it_is() {
+        for (rows, height, viewport) in [(208, 22, 22), (1000, 30, 25), (57, 17, 9), (41, 40, 12)] {
+            let lengths: Vec<usize> = (0..=rows - viewport)
+                .map(|scroll| ruler_band(rows, height, scroll, viewport).len())
+                .collect();
+            let first = lengths[0];
+            assert!(
+                lengths.iter().all(|len| *len == first),
+                "{rows}/{height}/{viewport}: {lengths:?}"
+            );
+            assert!(first >= MIN_THUMB);
+
+            // And it reaches both ends: the top at the top, the bottom at the
+            // bottom, with nothing left over.
+            let used = ruler_band(rows, height, 0, viewport);
+            let end = ruler_band(rows, height, rows - viewport, viewport);
+            assert_eq!(used.start, 0);
+            assert_eq!(end.end, (rows * height).div_ceil(ruler_span(rows, height)));
+        }
     }
 
     #[test]

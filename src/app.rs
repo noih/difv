@@ -83,6 +83,9 @@ pub struct App {
     pub files_hidden: bool,
     /// The divider being dragged: 0 between Files and Old, 1 between Old and New.
     drag: Option<usize>,
+    /// The change ruler is being dragged, so the view keeps following the
+    /// pointer until the button comes up.
+    ruler_drag: bool,
     /// The selected row of the settings panel, when it is open.
     pub settings: Option<usize>,
     /// Where the settings panel writes to. `None` when there is no home
@@ -188,6 +191,7 @@ impl App {
             weights: [26, 37, 37],
             files_hidden: false,
             drag: None,
+            ruler_drag: false,
             settings: None,
             // Tests build `App` directly, and a settings keypress writes; the
             // real config is not something a test may reach by default.
@@ -1085,17 +1089,29 @@ impl App {
             .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT);
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => {
+                // A release outside the terminal never arrives, so a stale drag
+                // would turn the next press into a resize, or leave a selection
+                // still growing under an autoscroll. Cleared before the two
+                // handles below are tested, since a new press ends whatever the
+                // last one left behind wherever it lands.
+                self.drag = None;
+                self.ruler_drag = false;
+                self.edge_drag = None;
+                self.selecting = None;
+                // The ruler is a view control drawn on a pane's border, so it
+                // is tested before the pane under it: a press there must not
+                // also land in the editor as a cursor move.
+                if let Some(cell) = self.ruler_cell_at(at) {
+                    self.ruler_drag = true;
+                    self.scroll_to_ruler(cell);
+                    return;
+                }
                 // A border between two panes is a handle first and part of a
                 // pane second, so it is tested before focus moves.
                 if let Some(divider) = self.divider_at(at) {
                     self.drag = Some(divider);
                     return;
                 }
-                // A release outside the terminal never arrives, so a stale drag
-                // would turn the next selection into a resize.
-                self.drag = None;
-                self.edge_drag = None;
-                self.selecting = None;
                 let Some(pane) = over else { return };
                 self.focus = pane;
                 match pane {
@@ -1135,6 +1151,17 @@ impl App {
                     self.notice_until = Some(Instant::now() + NOTICE_TTL);
                 }
             }
+            MouseEventKind::Drag(MouseButton::Left) if self.ruler_drag => {
+                // The pointer leaves the one-cell column almost immediately on
+                // the way down it, so the row is what matters and the column is
+                // not tested again until the button comes up.
+                let pane = self.panes[Pane::New as usize];
+                let height = pane.height.saturating_sub(2);
+                if height > 0 {
+                    let cell = at.y.saturating_sub(pane.y + 1).min(height - 1);
+                    self.scroll_to_ruler(cell as usize);
+                }
+            }
             MouseEventKind::Drag(MouseButton::Left) if let Some(index) = self.drag => {
                 self.drag_divider(index, at.x);
             }
@@ -1143,6 +1170,7 @@ impl App {
             }
             MouseEventKind::Up(MouseButton::Left) => {
                 self.drag = None;
+                self.ruler_drag = false;
                 self.edge_drag = None;
                 if self.selecting == Some(Pane::New)
                     && self
@@ -1324,6 +1352,40 @@ impl App {
 
     fn button_at(&self, at: Position) -> Option<usize> {
         (0..self.buttons.len()).find(|index| self.buttons[*index].contains(at))
+    }
+
+    /// The ruler cell a position is on, if it is on the ruler at all — the
+    /// Current pane's right border, between its corners.
+    fn ruler_cell_at(&self, at: Position) -> Option<usize> {
+        let pane = self.panes[Pane::New as usize];
+        let height = pane.height.saturating_sub(2);
+        if height == 0 || pane.width == 0 || at.x != pane.right().saturating_sub(1) {
+            return None;
+        }
+        let cell = at.y.checked_sub(pane.y + 1)?;
+        (cell < height).then_some(cell as usize)
+    }
+
+    /// Scroll so the rows a ruler cell stands for sit in the middle of the
+    /// viewport. A press is a jump rather than a grab: one cell covers many
+    /// rows, so carrying an offset would only be more precise in the case
+    /// where scrolling is not needed at all.
+    fn scroll_to_ruler(&mut self, cell: usize) {
+        let height = self.panes[Pane::New as usize].height.saturating_sub(2) as usize;
+        if height == 0 {
+            return;
+        }
+        // Across cells, not through them: the last cell has to reach the last
+        // row, or a drag down the whole ruler stops short of the end of the
+        // file by half a viewport and there is no way to ask for the rest.
+        let span = crate::ui::ruler_span(self.diff.rows.len(), height);
+        let row = match height {
+            1 => 0,
+            _ => cell * (span - 1) / (height - 1),
+        };
+        self.scroll = row
+            .saturating_sub(self.viewport_height / 2)
+            .min(self.max_scroll());
     }
 
     fn pane_at(&self, at: Position) -> Option<Pane> {
@@ -2274,6 +2336,106 @@ pub mod tests {
             modifiers: KeyModifiers::NONE,
         });
         assert_eq!(app.notice, None);
+    }
+
+    /// The ruler is a view control drawn on the editor's border: it scrolls,
+    /// and it touches nothing the editor owns.
+    #[test]
+    fn pressing_the_ruler_scrolls_and_leaves_the_editor_alone() {
+        let long: String = (0..200).map(|i| format!("line {i}\n")).collect();
+        let edited = long.replace("line 100\n", "line one hundred\n");
+        let fixture = Fixture::new("ruler", &long, &edited);
+        let mut app = fixture.app();
+        app.panes = [
+            Rect::new(0, 0, 26, 12),
+            Rect::new(26, 0, 32, 12),
+            Rect::new(58, 0, 32, 12),
+        ];
+        // The ruler is the Current pane's right border, between its corners.
+        let (ruler_x, top) = (58 + 32 - 1, 1);
+        let height = 12 - 2;
+        // Both come from the same layout in `draw`, so a test where they differ
+        // is a geometry the app never reaches.
+        app.viewport_height = height;
+        assert!(app.diff.rows.len() > height, "the file must not fit");
+
+        let press = |app: &mut App, row: u16, kind: MouseEventKind| {
+            app.on_mouse(MouseEvent {
+                kind,
+                column: ruler_x,
+                row,
+                modifiers: KeyModifiers::NONE,
+            })
+        };
+
+        // Focus and cursor start in the editor, with a selection under way.
+        app.focus = Pane::New;
+        app.on_key(ctrl('a'));
+        let before = app.buffer().map(|b| (b.cursor(), b.selection()));
+        let selected_file = app.file_state.selected();
+
+        press(&mut app, top + 5, MouseEventKind::Down(MouseButton::Left));
+        let span = app.diff.rows.len().max(height);
+        let expected = (5 * (span - 1) / (height - 1)).saturating_sub(app.viewport_height / 2);
+        assert_eq!(app.scroll, expected.min(app.max_scroll()));
+        assert!(app.scroll > 0, "a press halfway down scrolls");
+        // The rows that cell marks are the rows now on screen.
+        let banded =
+            crate::ui::ruler_band(app.diff.rows.len(), height, app.scroll, app.viewport_height);
+        assert!(
+            banded.contains(&5),
+            "{banded:?} should hold the cell pressed"
+        );
+
+        assert_eq!(app.focus, Pane::New, "focus untouched");
+        assert_eq!(app.buffer().map(|b| (b.cursor(), b.selection())), before);
+        assert_eq!(app.file_state.selected(), selected_file);
+        assert_eq!(app.old_selection(), None);
+        // Nothing is left armed to turn the next drag into a text selection.
+        assert_eq!(app.selecting, None);
+        assert_eq!(app.edge_drag, None);
+
+        // A drag follows the pointer and stops at the end of the file.
+        press(
+            &mut app,
+            top + height as u16 - 1,
+            MouseEventKind::Drag(MouseButton::Left),
+        );
+        assert_eq!(app.scroll, app.max_scroll());
+
+        // Once the button is up the same motion is no longer a scroll.
+        press(
+            &mut app,
+            top + height as u16 - 1,
+            MouseEventKind::Up(MouseButton::Left),
+        );
+        app.scroll = 0;
+        press(&mut app, top + 5, MouseEventKind::Drag(MouseButton::Left));
+        assert_eq!(app.scroll, 0, "the drag was disarmed");
+    }
+
+    /// The border cell one column to the left is the pane, not the ruler, and a
+    /// press there must still reach the editor.
+    #[test]
+    fn only_the_ruler_column_is_the_ruler() {
+        let fixture = Fixture::new("ruler-column", "a\nb\nc\n", "a\nB\nc\n");
+        let mut app = fixture.app();
+        let pane = Rect::new(58, 0, 32, 12);
+        app.panes = [Rect::new(0, 0, 26, 12), Rect::new(26, 0, 32, 12), pane];
+
+        assert_eq!(app.ruler_cell_at(Position::new(89, 1)), Some(0));
+        assert_eq!(app.ruler_cell_at(Position::new(89, 10)), Some(9));
+        assert_eq!(
+            app.ruler_cell_at(Position::new(88, 5)),
+            None,
+            "inside the pane"
+        );
+        assert_eq!(app.ruler_cell_at(Position::new(89, 0)), None, "the corner");
+        assert_eq!(app.ruler_cell_at(Position::new(89, 11)), None, "the corner");
+
+        // A pane with no room between its corners has no ruler at all.
+        app.panes[Pane::New as usize] = Rect::new(58, 0, 32, 2);
+        assert_eq!(app.ruler_cell_at(Position::new(89, 1)), None);
     }
 
     #[test]
