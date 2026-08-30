@@ -1,4 +1,5 @@
 use anyhow::{Result, bail};
+use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -225,17 +226,33 @@ impl Repo {
         let mut files = parse_raw_z(&raw);
         if self.worktree {
             let out = self.git(&["ls-files", "--others", "--exclude-standard", "-z"])?;
-            files.extend(
-                out.split(|b| *b == 0)
-                    .filter(|r| !r.is_empty())
-                    .map(|r| ChangedFile {
-                        path: bytes_to_path(r),
+            // A path `diff` calls deleted that is still on disk is one taken
+            // out of the index (`git rm --cached`): git, comparing only what
+            // the index tracks, sees the deletion and never the file. difv
+            // compares HEAD against the working tree and nothing in between,
+            // and there the file is on both sides — one file that changed,
+            // not one deleted and another added under its name. So the row
+            // is kept, as a modification, and the disk copy is what its
+            // Current side reads.
+            let deleted: HashMap<PathBuf, usize> = files
+                .iter()
+                .enumerate()
+                .filter(|(_, f)| f.status == Status::Deleted)
+                .map(|(i, f)| (f.path.clone(), i))
+                .collect();
+            for path in out.split(|b| *b == 0).filter(|r| !r.is_empty()) {
+                let path = bytes_to_path(path);
+                match deleted.get(&path) {
+                    Some(&i) => files[i].status = Status::Modified,
+                    None => files.push(ChangedFile {
+                        path,
                         old_path: None,
                         status: Status::Added,
                         old_blob: None,
                         new_blob: None,
                     }),
-            );
+                }
+            }
         }
         files.sort_by(|a, b| a.path.cmp(&b.path));
         Ok(files)
@@ -846,6 +863,31 @@ mod tests {
             "a revision, by contrast, is git's to settle"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `git rm --cached` leaves a file in HEAD and on disk with nothing in
+    /// the index between them. To git that is a deletion plus an untracked
+    /// file; to difv, which never looks at the index, it is one file whose
+    /// two sides are both there.
+    #[test]
+    fn a_file_taken_out_of_the_index_is_one_modified_row() {
+        let fixture = crate::app::tests::Fixture::new("rm-cached", "one\n", "two\n");
+        fixture.git(&["rm", "--cached", "-q", "file.txt"]);
+        let repo = Repo::discover(fixture.dir())
+            .unwrap()
+            .with_revs(Vec::new())
+            .unwrap();
+
+        let files = repo.changed_files().unwrap();
+        assert_eq!(files.len(), 1, "{files:?}");
+        let file = &files[0];
+        assert_eq!(file.status, Status::Modified);
+        assert_eq!(repo.old_content(file), "one\n", "HEAD on the Before side");
+        assert_eq!(
+            repo.new_content(file).text(),
+            "two\n",
+            "the disk on the Current side"
+        );
     }
 
     /// The revisions are kept as typed and resolved on every listing, so a
