@@ -48,10 +48,10 @@ difv main..feature   # one revision against another
 Anything `git` accepts as a revision works, because `git` is what resolves it.
 A revision on the right is read-only; the working tree is not.
 
-`difv <path>` points it at a repository you are not standing in. A directory only
-says which repository — the list is the whole repository's changes either way —
-and a file says which repository *and* which file to open on. Put `--` before a
-path whose name is also a branch.
+`difv -C <path>` points it at a repository you are not standing in, the way
+`git -C` does. A directory only says which repository — the list is the whole
+repository's changes either way — and a file says which repository *and* which
+file to open on.
 
 - Click, scroll, or arrow around; drag a border to resize; drag to select and
   `Ctrl+C` to copy from either side; right-click a file to copy its path. The

@@ -134,21 +134,6 @@ impl Repo {
         Ok(OsString::from(String::from_utf8(empty)?.trim().to_string()))
     }
 
-    /// Whether git can resolve this argument as a revision — including the
-    /// range forms, which is why this is not `rev-parse --verify`. The `--`
-    /// keeps a name that is also a file from being taken as a path, so the
-    /// answer is about the revision alone.
-    pub fn is_revision(&self, arg: &OsStr) -> bool {
-        let args = [
-            OsStr::new("rev-parse"),
-            OsStr::new("--revs-only"),
-            arg,
-            OsStr::new("--"),
-        ];
-        self.run(&args)
-            .is_ok_and(|out| out.status.success() && !out.stdout.is_empty())
-    }
-
     pub fn worktree(&self) -> bool {
         self.worktree
     }
@@ -795,17 +780,12 @@ mod tests {
         assert_eq!(now.new_content(&file).text(), "three\n");
     }
 
-    /// A revision git cannot resolve is refused in git's own words, and one it
-    /// can is recognised whatever its form.
+    /// A revision git cannot resolve is refused in git's own words, with the
+    /// prefix difv's own `difv: ` replaces taken off.
     #[test]
     fn a_bad_revision_is_refused_in_gits_words() {
         let fixture = crate::app::tests::Fixture::new("bad-rev", "a\n", "b\n");
         let repo = Repo::discover(fixture.dir()).unwrap();
-
-        assert!(repo.is_revision(OsStr::new("HEAD")));
-        assert!(repo.is_revision(OsStr::new("HEAD^!")));
-        assert!(!repo.is_revision(OsStr::new("nope")));
-        assert!(!repo.is_revision(OsStr::new("file.txt")));
 
         let Err(err) = repo.with_revs(vec![OsString::from("nope")]) else {
             panic!("a revision git cannot resolve is refused");

@@ -152,7 +152,7 @@ impl App {
             .and_then(|rel| self.files.iter().position(|f| f.path == rel));
         match index {
             Some(index) => self.select(index),
-            None if !path.exists() => bail!("no such path or revision: {}", path.display()),
+            None if !path.exists() => bail!("no such path: {}", path.display()),
             None => {
                 self.notice = Some(format!("{} has no changes", path.display()));
                 self.notice_until = Some(Instant::now() + NOTICE_TTL);
@@ -2870,11 +2870,11 @@ pub mod tests {
         assert_eq!(fixture.read(), "xtwo\n");
     }
 
-    /// A file argument is looked up in the list the revisions produce, so a
-    /// file a commit touched can be opened by name whether or not it still
+    /// The file `-C` names is looked up in the list the revisions produce, so
+    /// a file a commit touched can be opened by name whether or not it still
     /// differs from `HEAD`.
     #[test]
-    fn a_file_argument_selects_from_the_compared_list() {
+    fn a_file_given_to_dash_c_selects_from_the_compared_list() {
         let fixture = Fixture::new("revision-select", "one\n", "one\n");
         fixture.write_file("other.txt", "other\n");
         fixture.write("two\n");
