@@ -240,10 +240,11 @@ impl Repo {
                 .filter(|(_, f)| f.status == Status::Deleted)
                 .map(|(i, f)| (f.path.clone(), i))
                 .collect();
+            let mut both_sides = Vec::new();
             for path in out.split(|b| *b == 0).filter(|r| !r.is_empty()) {
                 let path = bytes_to_path(path);
                 match deleted.get(&path) {
-                    Some(&i) => files[i].status = Status::Modified,
+                    Some(&i) => both_sides.push(i),
                     None => files.push(ChangedFile {
                         path,
                         old_path: None,
@@ -253,9 +254,64 @@ impl Repo {
                     }),
                 }
             }
+            // Or dropped, when the disk copy is what HEAD has: then nothing
+            // difv compares differs.
+            let unchanged = self.unchanged_on_disk(&files, &both_sides)?;
+            for &i in &both_sides {
+                files[i].status = Status::Modified;
+            }
+            let mut index = 0..;
+            files.retain(|_| !unchanged.contains(&index.next().unwrap()));
         }
         files.sort_by(|a, b| a.path.cmp(&b.path));
         Ok(files)
+    }
+
+    /// Which of the given rows have, on disk, exactly the blob HEAD has —
+    /// asked of git in one call for all of them, and not at all when there
+    /// are none, which is every listing without a `git rm --cached` in it.
+    /// `hash-object` runs the same filters git would on `add`, so a file that
+    /// differs only in what the attributes normalise away is unchanged here
+    /// too, as it would be to `git diff`.
+    fn unchanged_on_disk(&self, files: &[ChangedFile], rows: &[usize]) -> Result<Vec<usize>> {
+        if rows.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut input = Vec::new();
+        for &i in rows {
+            input.extend_from_slice(files[i].path.as_os_str().as_encoded_bytes());
+            input.push(b'\n');
+        }
+        let out = self.git_with_stdin(&["hash-object", "--stdin-paths"], &input)?;
+        let ids = String::from_utf8_lossy(&out);
+        Ok(rows
+            .iter()
+            .copied()
+            .zip(ids.lines())
+            .filter(|(i, id)| files[*i].old_blob.as_deref() == Some(id.trim()))
+            .map(|(i, _)| i)
+            .collect())
+    }
+
+    fn git_with_stdin(&self, args: &[&str], input: &[u8]) -> Result<Vec<u8>> {
+        use std::process::Stdio;
+        let mut child = Command::new("git")
+            .arg("-C")
+            .arg(&self.root)
+            .args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin.write_all(input)?;
+        }
+        let out = child.wait_with_output()?;
+        if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            bail!("git {}: {}", args[0], stderr.lines().next().unwrap_or(""));
+        }
+        Ok(out.stdout)
     }
 
     fn diff_raw(&self, revs: &[OsString]) -> Result<Vec<u8>> {
@@ -888,6 +944,11 @@ mod tests {
             "two\n",
             "the disk on the Current side"
         );
+
+        // The same file with HEAD's own content on disk differs in nothing
+        // difv compares, so it is not listed at all.
+        fixture.write("one\n");
+        assert!(repo.changed_files().unwrap().is_empty());
     }
 
     /// The revisions are kept as typed and resolved on every listing, so a
