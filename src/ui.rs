@@ -891,7 +891,10 @@ mod tests {
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
         let open = terminal.backend().to_string();
         assert!(open.contains("Keys"), "{open}");
-        assert!(open.contains("Hide / show the file and commit lists"), "{open}");
+        assert!(
+            open.contains("Hide / show the file and commit lists"),
+            "{open}"
+        );
     }
 
     /// What a terminal shows after ratatui's diff is applied to it. Ratatui's
