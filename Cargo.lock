@@ -293,7 +293,7 @@ dependencies = [
 
 [[package]]
 name = "difv"
-version = "1.0.3"
+version = "1.0.4"
 dependencies = [
  "anyhow",
  "crossterm",

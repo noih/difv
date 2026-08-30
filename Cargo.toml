@@ -1,6 +1,6 @@
 [package]
 name = "difv"
-version = "1.0.3"
+version = "1.0.4"
 edition = "2024"
 rust-version = "1.88"
 description = "Review and tweak your Git changes side by side, in the terminal."
