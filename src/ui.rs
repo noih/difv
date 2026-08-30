@@ -58,8 +58,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     if !app.files_hidden {
         draw_files(frame, app, files);
     }
-    draw_side(frame, app, old, Pane::Old);
-    draw_side(frame, app, new, Pane::New);
+    let labels = app.repo.labels();
+    draw_side(frame, app, old, Pane::Old, &labels);
+    draw_side(frame, app, new, Pane::New, &labels);
     // One ruler, not two: the panes share a scroll position, so a second would
     // only repeat the first.
     draw_ruler(frame, app, new);
@@ -323,9 +324,14 @@ fn draw_files(frame: &mut Frame, app: &mut App, area: Rect) {
     frame.render_stateful_widget(list, area, &mut app.file_state);
 }
 
-fn draw_side(frame: &mut Frame, app: &App, area: Rect, side: Pane) {
+fn draw_side(
+    frame: &mut Frame,
+    app: &App,
+    area: Rect,
+    side: Pane,
+    (old_label, new_label): &(String, String),
+) {
     let old_side = side == Pane::Old;
-    let (old_label, new_label) = app.repo.labels();
     let (title, lines_src) = if old_side {
         (format!("{old_label} / Before"), &app.diff.old[..])
     } else {

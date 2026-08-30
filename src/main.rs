@@ -171,13 +171,14 @@ fn open_repo(target: &Target) -> Result<Repo, String> {
     })
 }
 
-/// A revision git could not resolve. When the argument is also on disk it is
-/// almost certainly the positional path difv took before `-C` existed, so the
-/// refusal says where a path goes now — one `stat`, on a command line that is
-/// being refused anyway.
-fn bad_revision(err: &anyhow::Error, revs: &[OsString]) -> String {
+/// A revision git could not resolve. When the argument is also on disk — here,
+/// or in the repository `-C` pointed at — it is almost certainly the positional
+/// path difv took before `-C` existed, so the refusal says where a path goes
+/// now: a `stat` or two, on a command line that is being refused anyway.
+fn bad_revision(err: &anyhow::Error, revs: &[OsString], start: &Path) -> String {
     let message = err.to_string();
-    match revs.iter().any(|rev| Path::new(rev).exists()) {
+    let on_disk = |rev: &OsString| Path::new(rev).exists() || start.join(rev).exists();
+    match revs.iter().any(on_disk) {
         true => format!("{message} — a path goes after -C"),
         false => message,
     }
@@ -232,7 +233,7 @@ fn main() -> Result<()> {
     // already knows, and one difv could only paraphrase worse.
     let repo = match repo.with_revs(revs.clone()) {
         Ok(repo) => repo,
-        Err(err) => refuse(&bad_revision(&err, &revs)),
+        Err(err) => refuse(&bad_revision(&err, &revs, &target.start)),
     };
     // Both of these run before the alternate screen so their output lands on a
     // normal terminal rather than a torn-down TUI.
@@ -519,8 +520,18 @@ mod tests {
         let Err(err) = repo.with_revs(vec![file.clone()]) else {
             panic!("a path is not a revision");
         };
-        let pointed = bad_revision(&err, &[file]);
+        let pointed = bad_revision(&err, &[file], Path::new("."));
         assert!(pointed.contains("bad revision"), "{pointed}");
+        assert!(pointed.ends_with(" — a path goes after -C"), "{pointed}");
+
+        // The path may be the second argument, and relative to the repository
+        // `-C` named rather than to where difv was run.
+        let repo = Repo::discover(fixture.dir()).unwrap();
+        let second = vec![OsString::from("HEAD"), OsString::from("file.txt")];
+        let Err(err) = repo.with_revs(second.clone()) else {
+            panic!("a path is not a revision");
+        };
+        let pointed = bad_revision(&err, &second, fixture.dir());
         assert!(pointed.ends_with(" — a path goes after -C"), "{pointed}");
 
         // An argument that is not on disk is only ever a bad revision.
@@ -528,7 +539,7 @@ mod tests {
         let Err(err) = repo.with_revs(vec![OsString::from("nope")]) else {
             panic!("a name that resolves to nothing is refused");
         };
-        let plain = bad_revision(&err, &[OsString::from("nope")]);
+        let plain = bad_revision(&err, &[OsString::from("nope")], fixture.dir());
         assert_eq!(plain, "bad revision 'nope'");
     }
 

@@ -130,8 +130,8 @@ impl Repo {
         let (old, new) = match typed.as_slice() {
             [] => ("HEAD".to_string(), WORKING_TREE.to_string()),
             [one] => split_revision(one),
-            [a, b] => (a.clone(), b.clone()),
-            _ => (typed.join(" "), "Current".to_string()),
+            // Two is the most the command line lets through.
+            [a, b, ..] => (a.clone(), b.clone()),
         };
         // One argument can still name one commit — a plain revision always
         // does, a root commit's `^!` does too — and then the Current side is
@@ -184,15 +184,16 @@ impl Repo {
     fn git<S: AsRef<OsStr>>(&self, args: &[S]) -> Result<Vec<u8>> {
         let out = self.run(args)?;
         if !out.status.success() {
-            let shown: Vec<String> = args
-                .iter()
+            // One line, as every refusal is: git's first line says what went
+            // wrong, and the rest — a usage screen, a hint — is not for here.
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            let first = stderr.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
+            let first = first.strip_prefix("fatal: ").unwrap_or(first).trim();
+            let subcommand = args
+                .first()
                 .map(|a| a.as_ref().to_string_lossy().into_owned())
-                .collect();
-            bail!(
-                "git {:?}: {}",
-                shown,
-                String::from_utf8_lossy(&out.stderr).trim()
-            );
+                .unwrap_or_default();
+            bail!("git {subcommand}: {first}");
         }
         Ok(out.stdout)
     }
@@ -213,7 +214,12 @@ impl Repo {
             // difv is open shows up on `r` like any other.
             true => match self.diff_raw(&[OsString::from("HEAD")]) {
                 Ok(raw) => raw,
-                Err(_) => self.diff_raw(&[self.empty_tree()?])?,
+                // Only a `HEAD` that does not exist is a reason to compare
+                // against nothing; any other failure is one to report.
+                Err(err) => match self.has_head() {
+                    false => self.diff_raw(&[self.empty_tree()?])?,
+                    true => return Err(err),
+                },
             },
         };
         let mut files = parse_raw_z(&raw);
@@ -243,6 +249,13 @@ impl Repo {
         args.extend(revs.iter().cloned());
         args.push(OsString::from("--"));
         self.git(&args)
+    }
+
+    /// Whether `HEAD` names a commit yet. Asked only after `diff HEAD` has
+    /// failed, which is the one time the answer decides anything.
+    fn has_head(&self) -> bool {
+        self.run(&["rev-parse", "--verify", "--quiet", "HEAD"])
+            .is_ok_and(|out| out.status.success())
     }
 
     /// The id of the tree with nothing in it, asked for rather than written
@@ -480,7 +493,6 @@ fn parse_raw_z(buf: &[u8]) -> Vec<ChangedFile> {
             new_blob: blob_id(new_id),
         });
     }
-    files.sort_by(|a, b| a.path.cmp(&b.path));
     files
 }
 
@@ -637,7 +649,9 @@ mod tests {
                     :100644 000000 ddd1 0000 D\0src/old.ts\0\
                     :100644 100644 eee1 eee1 R100\0old.ts\0new.ts\0\
                     :100644 100644 fff1 0000000 M\0src/my file.ts\0";
-        let got: Vec<String> = parse_raw_z(raw)
+        let mut files = parse_raw_z(raw);
+        files.sort_by(|a, b| a.path.cmp(&b.path));
+        let got: Vec<String> = files
             .iter()
             .map(|f| {
                 format!(
@@ -832,6 +846,52 @@ mod tests {
             "a revision, by contrast, is git's to settle"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The revisions are kept as typed and resolved on every listing, so a
+    /// branch that moves while difv is open is followed on `r`.
+    #[test]
+    fn a_listing_follows_a_branch_that_moved() {
+        let fixture = crate::app::tests::Fixture::new("moved-branch", "one\n", "one\n");
+        fixture.git(&["branch", "feature"]);
+        let repo = Repo::discover(fixture.dir())
+            .unwrap()
+            .with_revs(vec![OsString::from("HEAD..feature")])
+            .unwrap();
+        assert!(repo.changed_files().unwrap().is_empty(), "the same commit");
+
+        fixture.git(&["checkout", "-q", "feature"]);
+        fixture.write_file("grown.txt", "x\n");
+        fixture.git(&["add", "-A"]);
+        fixture.git(&["commit", "-qm", "grow"]);
+        fixture.git(&["checkout", "-q", "-"]);
+
+        let names: Vec<String> = repo
+            .changed_files()
+            .unwrap()
+            .iter()
+            .map(|f| f.path.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, ["grown.txt"]);
+    }
+
+    /// Comparing against nothing is for a repository with no `HEAD` yet, and
+    /// for nothing else: a `diff` that fails for another reason is reported,
+    /// not painted over as "everything is new". A blob is one such reason —
+    /// it passes `rev-parse` but is not something `diff` compares.
+    #[test]
+    fn only_a_missing_head_compares_against_nothing() {
+        let fixture = crate::app::tests::Fixture::new("not-unborn", "a\n", "b\n");
+        let repo = Repo::discover(fixture.dir())
+            .unwrap()
+            .with_revs(vec![OsString::from("HEAD:file.txt")])
+            .unwrap();
+        let Err(err) = repo.changed_files() else {
+            panic!("a blob is not a side `diff` can take");
+        };
+        let err = err.to_string();
+        assert_eq!(err.lines().count(), 1, "one line, not git's usage: {err}");
+        assert!(err.starts_with("git diff: "), "{err}");
     }
 
     /// A revision git cannot resolve is refused in git's own words, with the
