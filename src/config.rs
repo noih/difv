@@ -192,15 +192,23 @@ fn layout_path() -> Option<PathBuf> {
 
 /// The pane widths from the last run, if they were saved and still make sense.
 /// Anything else means the default layout, which is always usable.
-pub fn load_layout() -> Option<[u16; 3]> {
+/// What a divider drag leaves behind: the three column widths, and the two
+/// heights the left column is split into.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Layout {
+    pub weights: [u16; 3],
+    pub split: [u16; 2],
+}
+
+pub fn load_layout() -> Option<Layout> {
     parse_layout(&std::fs::read_to_string(layout_path()?).ok()?)
 }
 
-pub fn save_layout(weights: [u16; 3]) -> anyhow::Result<()> {
+pub fn save_layout(layout: Layout) -> anyhow::Result<()> {
     let Some(path) = layout_path() else {
         return Ok(());
     };
-    write(&path, &render_layout(weights))
+    write(&path, &render_layout(layout))
 }
 
 /// Write the whole file. difv owns every key it knows about, so anything the
@@ -245,21 +253,40 @@ fn render(config: &Config) -> String {
     )
 }
 
-fn parse_layout(text: &str) -> Option<[u16; 3]> {
+fn parse_layout(text: &str) -> Option<Layout> {
     let table: toml::Table = text.parse().ok()?;
-    let values = table.get("weights")?.as_array()?;
-    let widths: Vec<u16> = values
-        .iter()
-        .filter_map(|value| u16::try_from(value.as_integer()?).ok())
-        .filter(|width| *width > 0)
-        .collect();
-    <[u16; 3]>::try_from(widths.as_slice()).ok()
+    let numbers = |key: &str| -> Option<Vec<u16>> {
+        Some(
+            table
+                .get(key)?
+                .as_array()?
+                .iter()
+                .filter_map(|value| u16::try_from(value.as_integer()?).ok())
+                .filter(|width| *width > 0)
+                .collect(),
+        )
+    };
+    Some(Layout {
+        weights: <[u16; 3]>::try_from(numbers("weights")?.as_slice()).ok()?,
+        // A file written before the Commits pane existed has widths and no
+        // split; its widths are still what the user arranged.
+        split: numbers("split")
+            .and_then(|split| <[u16; 2]>::try_from(split.as_slice()).ok())
+            .unwrap_or(DEFAULT_SPLIT),
+    })
 }
 
-fn render_layout([files, old, new]: [u16; 3]) -> String {
+/// The Changes pane and the Commits pane share the column evenly until a drag
+/// says otherwise.
+pub const DEFAULT_SPLIT: [u16; 2] = [1, 1];
+
+fn render_layout(layout: Layout) -> String {
+    let [files, old, new] = layout.weights;
+    let [changes, commits] = layout.split;
     format!(
         "# Written by difv. Set `remember_layout = false` in config.toml to stop.\n\
-         weights = [{files}, {old}, {new}]\n"
+         weights = [{files}, {old}, {new}]\n\
+         split = [{changes}, {commits}]\n"
     )
 }
 
@@ -394,9 +421,29 @@ mod tests {
 
     #[test]
     fn a_saved_layout_round_trips_and_junk_is_ignored() {
+        let layout = Layout {
+            weights: [30, 40, 50],
+            split: [7, 5],
+        };
+        assert_eq!(parse_layout(&render_layout(layout)), Some(layout));
+
+        // A file written before the Commits pane existed still says what the
+        // user arranged about the columns.
         assert_eq!(
-            parse_layout(&render_layout([30, 40, 50])),
-            Some([30, 40, 50])
+            parse_layout("weights = [30, 40, 50]"),
+            Some(Layout {
+                weights: [30, 40, 50],
+                split: DEFAULT_SPLIT,
+            })
+        );
+        // A split that cannot be trusted is the default, not a refusal: the
+        // widths beside it are still good.
+        assert_eq!(
+            parse_layout("weights = [30, 40, 50]\nsplit = [0, 3]"),
+            Some(Layout {
+                weights: [30, 40, 50],
+                split: DEFAULT_SPLIT,
+            })
         );
 
         // A file that cannot be trusted means the default layout, never a pane

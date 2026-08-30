@@ -5,6 +5,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use crate::commits::{Commit, Shape};
 use crate::config::{Eol, detect_eol};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -51,6 +52,9 @@ pub struct Repo {
     /// The revision arguments as typed. Empty means difv's own default of
     /// `HEAD` against the working tree.
     revs: Vec<OsString>,
+    /// The same, read as one of the three forms `git diff` offers — what the
+    /// pane titles and a pick in the Commits pane both work from.
+    shape: Shape,
     /// Whether the Current side is the working tree, which is what makes it
     /// editable, polled and able to hold untracked files.
     worktree: bool,
@@ -74,6 +78,7 @@ impl Repo {
         Ok(Self {
             root: PathBuf::from(root),
             revs: Vec::new(),
+            shape: Shape::of(&[]),
             worktree: true,
         })
     }
@@ -95,6 +100,7 @@ impl Repo {
         if revs.is_empty() {
             return Ok(self);
         }
+        self.shape = Shape::of(&revs);
         let mut args: Vec<&OsStr> = vec![OsStr::new("rev-parse"), OsStr::new("--revs-only")];
         args.extend(revs.iter().map(OsString::as_os_str));
         args.push(OsStr::new("--"));
@@ -118,29 +124,63 @@ impl Repo {
         self.worktree
     }
 
-    /// What the two panes are looking at, for their titles. Derived from the
-    /// text the user typed: the name they think in is the name they should
-    /// read back, and the merge base `a...b` compares against has no short
-    /// name to offer anyway.
+    /// What the two panes are looking at, for their titles.
     pub fn labels(&self) -> (String, String) {
-        let typed: Vec<String> = self
-            .revs
-            .iter()
-            .map(|r| r.to_string_lossy().into_owned())
-            .collect();
-        let (old, new) = match typed.as_slice() {
-            [] => ("HEAD".to_string(), WORKING_TREE.to_string()),
-            [one] => split_revision(one),
-            // Two is the most the command line lets through.
-            [a, b, ..] => (a.clone(), b.clone()),
-        };
-        // One argument can still name one commit — a plain revision always
-        // does, a root commit's `^!` does too — and then the Current side is
-        // the working tree whatever the syntax suggested.
-        match self.worktree {
-            true => (old, WORKING_TREE.to_string()),
-            false => (old, new),
+        self.shape.labels(self.worktree)
+    }
+
+    pub fn shape(&self) -> &Shape {
+        &self.shape
+    }
+
+    /// Compare something else, in the repository already open: the Commits
+    /// pane picking a commit is the only caller, and it hands over revisions
+    /// its shape produced. Nothing changes when git cannot resolve them — a
+    /// commit since garbage-collected leaves the comparison where it was.
+    pub fn retarget(&mut self, revs: Vec<OsString>) -> Result<()> {
+        let moved = Self {
+            root: self.root.clone(),
+            revs: Vec::new(),
+            shape: Shape::of(&[]),
+            worktree: true,
         }
+        .with_revs(revs)?;
+        self.revs = moved.revs;
+        self.shape = moved.shape;
+        self.worktree = moved.worktree;
+        Ok(())
+    }
+
+    /// One page of the history above `tip`, oldest last. NUL between the
+    /// fields because a subject may hold anything else, and `--skip` rather
+    /// than a long-lived child process: a page is tens of milliseconds even
+    /// thousands of commits down, and difv reads only as far as it is
+    /// scrolled.
+    pub fn log_page(&self, tip: &OsStr, skip: usize, count: usize) -> Result<Vec<Commit>> {
+        let args: Vec<OsString> = vec![
+            OsString::from("log"),
+            OsString::from("--format=%H%x00%h%x00%s%x00"),
+            OsString::from(format!("--skip={skip}")),
+            OsString::from(format!("-n{count}")),
+            tip.to_os_string(),
+            OsString::from("--"),
+        ];
+        let out = self.git(&args)?;
+        let mut fields = out.split(|b| *b == 0);
+        let mut page = Vec::new();
+        while let (Some(hash), Some(short), Some(subject)) =
+            (fields.next(), fields.next(), fields.next())
+        {
+            if hash.is_empty() {
+                break;
+            }
+            page.push(Commit {
+                hash: String::from_utf8_lossy(hash).trim().to_string(),
+                short: String::from_utf8_lossy(short).into_owned(),
+                subject: String::from_utf8_lossy(subject).into_owned(),
+            });
+        }
+        Ok(page)
     }
 
     #[cfg(test)]
@@ -148,6 +188,7 @@ impl Repo {
         Self {
             root,
             revs: Vec::new(),
+            shape: Shape::of(&[]),
             worktree: true,
         }
     }
@@ -489,30 +530,6 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     result
 }
 
-/// The Current pane's label when it is the working tree rather than a
-/// revision.
-const WORKING_TREE: &str = "Working Tree";
-
-/// The two sides one revision argument names, for the pane titles. The order
-/// matters: `...` has to be tried before `..`, which is a prefix of it. An
-/// omitted end of a range is `HEAD`, as it is to git.
-fn split_revision(rev: &str) -> (String, String) {
-    let end = |text: &str| match text.is_empty() {
-        true => "HEAD".to_string(),
-        false => text.to_string(),
-    };
-    if let Some((a, b)) = rev.split_once("...") {
-        return (end(a), end(b));
-    }
-    if let Some((a, b)) = rev.split_once("..") {
-        return (end(a), end(b));
-    }
-    if let Some(base) = rev.strip_suffix("^!") {
-        return (format!("{base}^"), base.to_string());
-    }
-    (rev.to_string(), WORKING_TREE.to_string())
-}
-
 /// `git diff --raw -z` writes one `:<old mode> <new mode> <old id> <new id>
 /// <status>\0` record per file, followed by its path — or, for a rename or a
 /// copy, by the old path and then the new one. An id of all zeroes means
@@ -751,24 +768,6 @@ mod tests {
         );
     }
 
-    /// The pane titles say what was typed. `...` has to be tried before `..`,
-    /// and an omitted end of a range is `HEAD`, as it is to git.
-    #[test]
-    fn revision_labels_name_both_sides() {
-        let cases = [
-            ("main", ("main", WORKING_TREE)),
-            ("main..feature", ("main", "feature")),
-            ("main...feature", ("main", "feature")),
-            ("abc123^!", ("abc123^", "abc123")),
-            ("..feature", ("HEAD", "feature")),
-            ("main..", ("main", "HEAD")),
-        ];
-        for (rev, want) in cases {
-            let (old, new) = split_revision(rev);
-            assert_eq!((old.as_str(), new.as_str()), want, "{rev}");
-        }
-    }
-
     /// The pane labels through a `Repo`, where one argument naming one commit
     /// means the working tree is the Current side whatever the syntax said.
     #[test]
@@ -784,15 +783,18 @@ mod tests {
 
         assert_eq!(
             repo(&[]).labels(),
-            ("HEAD".to_string(), WORKING_TREE.to_string())
+            ("HEAD".to_string(), crate::commits::WORKING_TREE.to_string())
         );
         assert_eq!(
             repo(&["HEAD"]).labels(),
-            ("HEAD".to_string(), WORKING_TREE.to_string())
+            ("HEAD".to_string(), crate::commits::WORKING_TREE.to_string())
         );
         // The one commit there is has no parent, so `^!` names one commit and
         // git diffs it against the working tree — the title has to agree.
-        assert_eq!(repo(&[&format!("{head}^!")]).labels().1, WORKING_TREE);
+        assert_eq!(
+            repo(&[&format!("{head}^!")]).labels().1,
+            crate::commits::WORKING_TREE
+        );
     }
 
     /// The whole point of the revision arguments: what each form compares,

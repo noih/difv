@@ -48,6 +48,12 @@ difv main..feature   # one revision against another
 Anything `git` accepts as a revision works, because `git` is what resolves it.
 A revision on the right is read-only; the working tree is not.
 
+The **Commits** pane under the file list is that same history. `Enter` compares
+the commit under the cursor, in whatever form the command line asked for: after
+`difv main` it stays against the working tree, after `difv <rev>^!` it stays one
+commit's own changes, after `difv main..feature` it keeps `main` as the base.
+The **Working tree** row at the top is the way back.
+
 `difv -C <path>` points it at a repository you are not standing in, the way
 `git -C` does. A directory only says which repository — the list is the whole
 repository's changes either way — and a file says which repository *and* which

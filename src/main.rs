@@ -1,5 +1,6 @@
 mod app;
 mod clipboard;
+mod commits;
 mod config;
 mod diff;
 mod editor;
@@ -207,6 +208,9 @@ fn main() -> Result<()> {
                  \x20 difv <rev>^!       what that commit changed\n\
                  \x20 difv <a>..<b>      one revision against another\n\n\
                  A revision on the right is read-only; the working tree is not.\n\n\
+                 The Commits pane lists that history: `Enter` compares the commit\n\
+                 under the cursor, keeping the form above — against the working\n\
+                 tree, its own changes, or the same range's base.\n\n\
                  \x20 -C <path>        work in that repository, as it does for git.\n\
                  \x20                  A directory picks the repository; a file picks\n\
                  \x20                  the repository and opens on that file. Neither\n\
@@ -255,7 +259,10 @@ fn main() -> Result<()> {
         previous(info);
     }));
 
-    let layout = app.weights;
+    let layout = config::Layout {
+        weights: app.weights,
+        split: app.split,
+    };
     let mut terminal = ratatui::init();
     execute!(stdout(), Print(MOUSE_ON), EnableBracketedPaste)?;
     let result = run(&mut terminal, &mut app);
@@ -265,8 +272,12 @@ fn main() -> Result<()> {
     // Only after the panes are back to a plain terminal, and only when the user
     // actually moved a divider — an untouched layout has nothing to remember.
     if app.config.remember_layout
-        && app.weights != layout
-        && let Err(err) = config::save_layout(app.weights)
+        && let current = (config::Layout {
+            weights: app.weights,
+            split: app.split,
+        })
+        && current != layout
+        && let Err(err) = config::save_layout(current)
     {
         eprintln!("difv: could not save the layout: {err}");
     }

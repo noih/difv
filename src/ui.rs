@@ -37,26 +37,40 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).areas(frame.area());
     // Weights are cell widths, so a drag keeps its proportion across a resize.
     let [w_files, w_old, w_new] = app.weights;
-    let (files, old, new) = if app.files_hidden {
+    let (left, old, new) = if app.files_hidden {
         let [old, new] =
             Layout::horizontal([Constraint::Fill(w_old), Constraint::Fill(w_new)]).areas(body);
         (Rect::ZERO, old, new)
     } else {
-        let [files, old, new] = Layout::horizontal([
+        let [left, old, new] = Layout::horizontal([
             Constraint::Fill(w_files),
             Constraint::Fill(w_old),
             Constraint::Fill(w_new),
         ])
         .areas(body);
-        (files, old, new)
+        (left, old, new)
+    };
+    // The left column is two panes stacked, in the same relative units.
+    let (files, commits) = match app.files_hidden {
+        true => (Rect::ZERO, Rect::ZERO),
+        false => {
+            let [files, commits] = Layout::vertical([
+                Constraint::Fill(app.split[0]),
+                Constraint::Fill(app.split[1]),
+            ])
+            .areas(left);
+            (files, commits)
+        }
     };
 
     app.body = body;
-    app.panes = [files, old, new];
+    app.panes = [files, commits, old, new];
     app.viewport_height = old.height.saturating_sub(2) as usize;
+    app.commits_height = commits.height.saturating_sub(2) as usize;
 
     if !app.files_hidden {
         draw_files(frame, app, files);
+        draw_commits(frame, app, commits);
     }
     let labels = app.repo.labels();
     draw_side(frame, app, old, Pane::Old, &labels);
@@ -99,8 +113,9 @@ fn refresh_after_wide(buf: &mut ratatui::buffer::Buffer) {
 /// Every key difv answers to, except the two the footer already shows: this
 /// list is what `?` opens, so telling the reader about `?` is telling them what
 /// they just did.
-const HELP: [(&str, &str); 13] = [
+const HELP: [(&str, &str); 14] = [
     ("↑ ↓", "Select file / scroll / move the cursor"),
+    ("Enter", "Compare the commit under the cursor"),
     ("Shift+Tab", "Next pane, from anywhere"),
     ("Tab", "One indent, in the Current pane"),
     ("Alt+↑ ↓", "Previous / next change"),
@@ -274,6 +289,78 @@ fn block(title: &str, focused: bool) -> Block<'_> {
             format!(" {title} "),
             Style::new().add_modifier(Modifier::BOLD),
         ))
+}
+
+/// The commit being compared. ASCII for the same reason `DIRTY_MARK` is — a
+/// round dot is drawn two cells wide under a CJK font and shunts the row — and
+/// not `*`, which already means an unsaved buffer one pane above.
+const TARGET_MARK: &str = ">";
+
+/// One line of history, as far down it as anyone has looked. Only the rows on
+/// screen are laid out — the list behind them may hold tens of thousands —
+/// and the cursor and the picked commit are drawn differently, because they
+/// are two facts: where the reader is, and what is being compared.
+fn draw_commits(frame: &mut Frame, app: &mut App, area: Rect) {
+    let height = area.height.saturating_sub(2) as usize;
+    let width = area.width.saturating_sub(2) as usize;
+    let focused = app.focus == Pane::Commits;
+
+    let mut rows: Vec<ListItem> = Vec::with_capacity(height);
+    for row in app.commits.scroll..(app.commits.scroll + height).min(app.commits.len()) {
+        let target = app.commits.is_target(row);
+        let mark = match target {
+            true => TARGET_MARK,
+            false => " ",
+        };
+        let (id, subject) = match app.commits.at(row) {
+            Some(commit) => (commit.short.clone(), commit.subject.clone()),
+            None => (String::new(), "Working tree".to_string()),
+        };
+        let hash = match target {
+            true => Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            false => Style::new().fg(FG_GUTTER),
+        };
+        let mut line = vec![Span::styled(mark, Style::new().fg(Color::Yellow))];
+        if !id.is_empty() {
+            line.push(Span::styled(format!("{id} "), hash));
+        }
+        // The subject is whatever the commit said, so it is cut in display
+        // columns rather than bytes — a CJK subject is half as many characters
+        // as it is cells wide.
+        let room = width.saturating_sub(1 + id.width() + usize::from(!id.is_empty()));
+        line.push(Span::raw(cut(&subject, room)));
+        let style = match row == app.commits.cursor && focused {
+            true => Style::new()
+                .bg(Color::Rgb(0x2c, 0x30, 0x3a))
+                .add_modifier(Modifier::BOLD),
+            false if row == app.commits.cursor => Style::new().bg(Color::Rgb(0x23, 0x26, 0x2e)),
+            false => Style::new(),
+        };
+        rows.push(ListItem::new(Line::from(line).style(style)));
+    }
+
+    let tip = app.commits.tip().to_string_lossy();
+    let title = match tip.as_ref() {
+        "HEAD" => "Commits".to_string(),
+        other => format!("Commits ({other})"),
+    };
+    frame.render_widget(List::new(rows).block(block(&title, focused)), area);
+}
+
+/// A string cut to a number of display columns, so a wide glyph is never
+/// halved by the pane's edge.
+fn cut(text: &str, room: usize) -> String {
+    let mut out = String::new();
+    let mut col = 0;
+    for ch in text.chars() {
+        let cells = ch.width().unwrap_or(0);
+        if col + cells > room {
+            break;
+        }
+        out.push(ch);
+        col += cells;
+    }
+    out
 }
 
 fn draw_files(frame: &mut Frame, app: &mut App, area: Rect) {
@@ -594,7 +681,9 @@ fn draw_footer(frame: &mut Frame, app: &mut App, area: Rect) {
         app.buttons[index] = Rect::new(x, area.y, label.chars().count() as u16, 1);
         x += label.chars().count() as u16 + 1;
     }
-    let position = if app.diff.rows.is_empty() {
+    let position = if app.focus == Pane::Commits {
+        format!("{} ", app.commits.position())
+    } else if app.diff.rows.is_empty() {
         String::new()
     } else {
         let last = (app.scroll + app.viewport_height).min(app.diff.rows.len());
@@ -970,6 +1059,78 @@ mod tests {
         // A revision on the right is read-only, so it never carries the mark
         // an unsaved buffer would.
         assert!(!range.contains(DIRTY_MARK), "{range}");
+    }
+
+    /// The Commits pane sits under the Changes list, with the Working tree
+    /// row above the history, and says which row the reader is on and which
+    /// commit is being compared as two different things.
+    #[test]
+    fn the_commits_pane_shows_the_cursor_and_the_target_apart() {
+        use crate::app::tests::Fixture;
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let fixture = Fixture::new("commits-pane", "one\n", "two\n");
+        fixture.git(&["commit", "-qam", "second commit"]);
+        fixture.write("three\n");
+        let mut app = fixture.app();
+        app.focus = Pane::Commits;
+
+        let mut terminal = Terminal::new(TestBackend::new(100, 16)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let shown = terminal.backend().to_string();
+        assert!(shown.contains("Commits"), "{shown}");
+        assert!(shown.contains("Working tree"), "{shown}");
+
+        // The Commits pane is under the Changes pane, in the same column.
+        let changes = app.panes[Pane::Files as usize];
+        let commits = app.panes[Pane::Commits as usize];
+        assert_eq!(changes.x, commits.x);
+        assert_eq!(changes.bottom(), commits.y);
+
+        // Load the history, put the cursor on a commit and the target on the
+        // working tree: two rows, two marks.
+        app.commits_height = commits.height.saturating_sub(2) as usize;
+        app.commits
+            .ensure_loaded(&app.repo, app.commits_height)
+            .unwrap();
+        app.commits.go_to(1, app.commits_height);
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let shown = terminal.backend().to_string();
+        assert!(shown.contains("second commit"), "{shown}");
+        let row = |needle: &str| shown.lines().find(|l| l.contains(needle)).unwrap();
+        assert!(
+            row("Working tree").contains(TARGET_MARK),
+            "the target is the working tree: {shown}"
+        );
+        assert!(
+            !row("second commit").contains(TARGET_MARK),
+            "which is not where the cursor is: {shown}"
+        );
+    }
+
+    /// A history of thousands is drawn a screen at a time: the rows behind
+    /// the ones on show are never laid out.
+    #[test]
+    fn only_the_visible_commits_are_drawn() {
+        use crate::app::tests::Fixture;
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let fixture = Fixture::new("commits-window", "a\n", "b\n");
+        let mut app = fixture.app();
+        app.commits.fill_for_test(1000);
+
+        let mut terminal = Terminal::new(TestBackend::new(100, 16)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let shown = terminal.backend().to_string();
+        let height = app.panes[Pane::Commits as usize].height.saturating_sub(2) as usize;
+        assert!(height < 20, "the pane is a fraction of the terminal");
+        assert!(shown.contains("commit 0"), "the first row: {shown}");
+        assert!(
+            !shown.contains(&format!("commit {height}")),
+            "and nothing past the pane: {shown}"
+        );
     }
 
     /// A terminal shorter than a panel must scroll it, not hide the rows below

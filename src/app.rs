@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -8,6 +9,7 @@ use ratatui::layout::{Position, Rect};
 use ratatui::widgets::ListState;
 
 use crate::clipboard;
+use crate::commits::Commits;
 use crate::config::{self, Config};
 use crate::diff::{self, DiffModel};
 use crate::editor::{self, EditorBuffer, Selection};
@@ -17,6 +19,7 @@ use crate::settings;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Pane {
     Files,
+    Commits,
     Old,
     New,
 }
@@ -26,6 +29,8 @@ pub enum Pane {
 pub enum Prompt {
     Quit,
     Reload,
+    /// A commit was picked whose side cannot hold an editor.
+    Pick,
 }
 
 impl Prompt {
@@ -33,12 +38,15 @@ impl Prompt {
         match self {
             Prompt::Quit => "Unsaved changes. Quit anyway? (y/n)",
             Prompt::Reload => "Unsaved changes. Discard and reload? (y/n)",
+            Prompt::Pick => "Unsaved changes. Discard and compare that commit? (y/n)",
         }
     }
 }
 
 pub struct App {
     pub repo: Repo,
+    /// The line of history beside the diff, and where the reader is in it.
+    pub commits: Commits,
     pub config: Config,
     pub files: Vec<ChangedFile>,
     pub file_state: ListState,
@@ -74,15 +82,21 @@ pub struct App {
     /// button is held still — the terminal only reports a drag that moves.
     edge_drag: Option<Position>,
     /// Rects from the last render, kept so mouse clicks can be mapped back.
-    pub panes: [Rect; 3],
+    pub panes: [Rect; 4],
     /// The area the three panes share, so a divider drag can be bounded.
     pub body: Rect,
     pub viewport_height: usize,
     /// Relative pane widths, in cells at the time they were last set.
     pub weights: [u16; 3],
+    /// The Changes pane's share of the left column against the Commits
+    /// pane's, in the same relative units as `weights`.
+    pub split: [u16; 2],
+    /// Rows of commits on screen, correct only after a draw, like
+    /// `viewport_height`.
+    pub commits_height: usize,
     pub files_hidden: bool,
     /// The divider being dragged: 0 between Files and Old, 1 between Old and New.
-    drag: Option<usize>,
+    drag: Option<Divider>,
     /// The change ruler is being dragged, so the view keeps following the
     /// pointer until the button comes up.
     ruler_drag: bool,
@@ -111,6 +125,19 @@ pub struct App {
 /// A pane narrower than this is unreadable, so a drag stops there.
 const MIN_PANE: u16 = 8;
 
+/// Rows a pane in the left column never goes below: a border and one row of
+/// its own.
+const MIN_SPLIT: u16 = 3;
+
+/// A border two panes share, and which way a drag on it moves them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Divider {
+    /// Between two columns, by index into the three.
+    Column(usize),
+    /// Between the Changes pane and the Commits pane.
+    Split,
+}
+
 /// Columns one `←`/`→` or one sideways trackpad notch moves.
 const HSCROLL_STEP: isize = 4;
 
@@ -130,8 +157,9 @@ impl App {
         let files = repo.changed_files()?;
         let remember = config.remember_layout;
         let mut app = Self::with(repo, files, config);
-        if remember && let Some(weights) = crate::config::load_layout() {
-            app.weights = weights;
+        if remember && let Some(layout) = crate::config::load_layout() {
+            app.weights = layout.weights;
+            app.split = layout.split;
         }
         if let Some(path) = select {
             app.select_path(path)?;
@@ -165,6 +193,7 @@ impl App {
     /// rather than through repository discovery.
     pub fn with(repo: Repo, files: Vec<ChangedFile>, config: Config) -> Self {
         let mut app = Self {
+            commits: Commits::new(std::ffi::OsString::from(repo.shape().tip())),
             repo,
             config,
             files,
@@ -185,10 +214,12 @@ impl App {
             selecting: None,
             old_selection: None,
             edge_drag: None,
-            panes: [Rect::ZERO; 3],
+            panes: [Rect::ZERO; 4],
             body: Rect::ZERO,
             viewport_height: 1,
             weights: [26, 37, 37],
+            split: crate::config::DEFAULT_SPLIT,
+            commits_height: 0,
             files_hidden: false,
             drag: None,
             ruler_drag: false,
@@ -443,6 +474,15 @@ impl App {
     }
 
     fn refresh(&mut self) {
+        self.buffers.clear();
+        let _ = self.commits.reload(&self.repo, self.commits_height);
+        self.relist();
+    }
+
+    /// The changed files again, with the reader kept where they were: the
+    /// same file if it is still there, the first otherwise. Shared by `r` and
+    /// by picking a commit, which differ only in what they do to the buffers.
+    fn relist(&mut self) {
         let current = self.selected_file().map(|f| f.path.clone());
         match self.repo.changed_files() {
             Ok(files) => {
@@ -454,13 +494,60 @@ impl App {
                 return;
             }
         }
-        self.buffers.clear();
         let index = current
             .and_then(|path| self.files.iter().position(|f| f.path == path))
             .unwrap_or(0);
         self.file_state
             .select((!self.files.is_empty()).then_some(index.min(self.files.len() - 1)));
         self.load_diff();
+    }
+
+    /// Compare what the row under the Commits cursor stands for, in the form
+    /// the command line asked for. A pick that leaves the working tree on the
+    /// Current side keeps unsaved edits — only the Before side changed — and
+    /// one that does not has nowhere to put them, so it asks first, the way
+    /// `r` does.
+    fn pick(&mut self) {
+        let row = self.commits.cursor;
+        let commit = self.commits.at(row).map(|c| c.hash.clone());
+        let revs = match &commit {
+            Some(hash) => self.repo.shape().retarget(hash),
+            None => self.repo.shape().working_tree(),
+        };
+        // Whether an editor survives is git's answer about the new revisions,
+        // so it has to be asked before anything is thrown away.
+        if !self.dirty_files().is_empty()
+            && !self.repo.shape().pick_keeps_worktree(commit.as_deref())
+        {
+            self.prompt = Some(Prompt::Pick);
+            return;
+        }
+        self.apply_pick(revs, commit);
+    }
+
+    /// Move the Commits cursor, fetching another page if the move reached
+    /// for one. A page that will not come is a notice, not a stall.
+    fn move_commit(&mut self, by: isize) {
+        if let Err(err) = self
+            .commits
+            .move_cursor(by, &self.repo, self.commits_height)
+        {
+            self.notice = Some(err.to_string());
+            self.notice_until = Some(Instant::now() + NOTICE_TTL);
+        }
+    }
+
+    fn apply_pick(&mut self, revs: Vec<OsString>, commit: Option<String>) {
+        if let Err(err) = self.repo.retarget(revs) {
+            self.notice = Some(err.to_string());
+            self.notice_until = Some(Instant::now() + NOTICE_TTL);
+            return;
+        }
+        if !self.repo.worktree() {
+            self.buffers.clear();
+        }
+        self.commits.set_target(commit);
+        self.relist();
     }
 
     fn select(&mut self, index: usize) {
@@ -494,7 +581,8 @@ impl App {
 
     fn cycle_pane(&mut self) {
         self.focus = match next_pane(self.focus) {
-            Pane::Files if self.files_hidden => Pane::Old,
+            // Both left panes go with `Ctrl+B`, so both are skipped.
+            Pane::Files | Pane::Commits if self.files_hidden => Pane::Old,
             pane => pane,
         };
     }
@@ -506,7 +594,7 @@ impl App {
         // longer drawn.
         if !self.files_hidden {
             self.focus = Pane::Files;
-        } else if self.focus == Pane::Files {
+        } else if matches!(self.focus, Pane::Files | Pane::Commits) {
             self.focus = Pane::New;
         }
     }
@@ -514,7 +602,11 @@ impl App {
     /// Move a divider to a column, taking width from the pane on the other side
     /// so the pair keeps the room it had.
     fn drag_divider(&mut self, index: usize, x: u16) {
-        let (left, right) = (self.panes[index], self.panes[index + 1]);
+        let column = [Pane::Files, Pane::Old, Pane::New];
+        let (left, right) = (
+            self.panes[column[index] as usize],
+            self.panes[column[index + 1] as usize],
+        );
         let total = left.width + right.width;
         if total < MIN_PANE * 2 {
             return;
@@ -524,15 +616,16 @@ impl App {
         // weight in the old units and the ratio shifts under it. Restating
         // changes the scale, so a hidden pane — which has no width to read — is
         // scaled by the same factor or it comes back a different size.
+        let columns = column.map(|pane| self.panes[pane as usize]);
         let (cells, before) = self
             .weights
             .iter()
-            .zip(self.panes)
+            .zip(columns)
             .filter(|(_, pane)| pane.width > 0)
             .fold((0u32, 0u32), |(cells, before), (weight, pane)| {
                 (cells + pane.width as u32, before + *weight as u32)
             });
-        for (weight, pane) in self.weights.iter_mut().zip(self.panes) {
+        for (weight, pane) in self.weights.iter_mut().zip(columns) {
             *weight = if pane.width > 0 {
                 pane.width
             } else {
@@ -547,14 +640,39 @@ impl App {
 
     /// The divider under a column, if any. Both borders that meet there count,
     /// so the grab area is two cells wide rather than one.
-    fn divider_at(&self, at: Position) -> Option<usize> {
+    fn divider_at(&self, at: Position) -> Option<Divider> {
         if !self.body.contains(at) {
             return None;
         }
-        (0..2).find(|&index| {
-            let edge = self.panes[index + 1].x;
-            self.panes[index].width > 0 && (at.x == edge || at.x + 1 == edge)
-        })
+        let column = [Pane::Files, Pane::Old, Pane::New];
+        if let Some(index) = (0..2).find(|&index| {
+            let edge = self.panes[column[index + 1] as usize].x;
+            self.panes[column[index] as usize].width > 0 && (at.x == edge || at.x + 1 == edge)
+        }) {
+            return Some(Divider::Column(index));
+        }
+        // The two rows where the Changes pane's bottom border meets the
+        // Commits pane's top one, the same two-cell grab a column divider has.
+        let changes = self.panes[Pane::Files as usize];
+        let commits = self.panes[Pane::Commits as usize];
+        let inside = commits.width > 0 && (changes.x..changes.right()).contains(&at.x);
+        (inside && (at.y + 1 == commits.y || at.y == commits.y)).then_some(Divider::Split)
+    }
+
+    /// Move rows between the Changes pane and the Commits pane. The same idea
+    /// as a column drag, in one dimension less: the two share a total, and
+    /// neither goes below a border and a row.
+    fn drag_split(&mut self, y: u16) {
+        let (top, bottom) = (
+            self.panes[Pane::Files as usize],
+            self.panes[Pane::Commits as usize],
+        );
+        let total = top.height + bottom.height;
+        if total < MIN_SPLIT * 2 {
+            return;
+        }
+        let height = y.saturating_sub(top.y).clamp(MIN_SPLIT, total - MIN_SPLIT);
+        self.split = [height, total - height];
     }
 
     /// Columns of text one pane shows. The gutter and the borders are not
@@ -607,13 +725,20 @@ impl App {
     /// one column short of the cursor at the end of the widest line, since
     /// `follow_cursor` is one column more generous than `max_hscroll` there.
     pub fn clamp_scroll(&mut self) -> bool {
+        // The Commits pane's height is only correct after a draw, and its
+        // first page is only worth asking for once it is: a page is sized by
+        // the pane. Loaded here rather than at startup so the list is there
+        // before the first key, not after it.
+        let rows = self.commits.len();
+        let _ = self.commits.ensure_loaded(&self.repo, self.commits_height);
         let (scroll, hscroll) = (self.scroll, self.hscroll);
         self.scroll = self.scroll.min(self.max_scroll());
         self.hscroll = self.hscroll.min(self.max_hscroll());
         if self.editing() {
             self.widen_hscroll_for_cursor();
         }
-        scroll != self.scroll || hscroll != self.hscroll
+        // Rows that arrived are rows the frame just drawn does not have.
+        rows != self.commits.len() || scroll != self.scroll || hscroll != self.hscroll
     }
 
     fn scroll_by(&mut self, delta: isize) {
@@ -730,9 +855,14 @@ impl App {
                 self.prompt = None;
                 match prompt {
                     Prompt::Quit => self.quit = true,
-                    Prompt::Reload => {
-                        self.buffers.clear();
-                        self.refresh();
+                    Prompt::Reload => self.refresh(),
+                    Prompt::Pick => {
+                        let commit = self.commits.at(self.commits.cursor).map(|c| c.hash.clone());
+                        let revs = match &commit {
+                            Some(hash) => self.repo.shape().retarget(hash),
+                            None => self.repo.shape().working_tree(),
+                        };
+                        self.apply_pick(revs, commit);
                     }
                 }
             }
@@ -841,6 +971,25 @@ impl App {
 
             KeyCode::Down if alt => self.jump_hunk(true),
             KeyCode::Up if alt => self.jump_hunk(false),
+
+            // The Commits pane browses without asking git anything: moving
+            // the cursor is what makes a page arrive, and `Enter` alone is
+            // what makes a comparison.
+            KeyCode::Enter if self.focus == Pane::Commits => self.pick(),
+            KeyCode::Down if self.focus == Pane::Commits => self.move_commit(1),
+            KeyCode::Up if self.focus == Pane::Commits => self.move_commit(-1),
+            KeyCode::PageDown if self.focus == Pane::Commits => {
+                self.move_commit(self.commits_height.max(1) as isize)
+            }
+            KeyCode::PageUp if self.focus == Pane::Commits => {
+                self.move_commit(-(self.commits_height.max(1) as isize))
+            }
+            KeyCode::Home if self.focus == Pane::Commits => {
+                self.commits.go_to(0, self.commits_height)
+            }
+            KeyCode::End if self.focus == Pane::Commits => {
+                self.commits.go_to(usize::MAX, self.commits_height)
+            }
 
             KeyCode::Down if self.focus == Pane::Files => self.move_selection(1),
             KeyCode::Up if self.focus == Pane::Files => self.move_selection(-1),
@@ -1137,10 +1286,22 @@ impl App {
                 match pane {
                     Pane::Files => {
                         // +1 for the block border above the first row.
-                        let offset = mouse.row.saturating_sub(self.panes[0].y + 1) as usize;
+                        let top = self.panes[Pane::Files as usize].y + 1;
+                        let offset = mouse.row.saturating_sub(top) as usize;
                         let index = self.file_state.offset() + offset;
                         if index < self.files.len() {
                             self.select(index);
+                        }
+                    }
+                    // Clicking a commit is picking it: the two-step of cursor
+                    // then `Enter` is for the keyboard, which has no way to
+                    // say "this one" in one gesture.
+                    Pane::Commits => {
+                        let top = self.panes[Pane::Commits as usize].y + 1;
+                        let row = self.commits.scroll + mouse.row.saturating_sub(top) as usize;
+                        if row < self.commits.len() {
+                            self.commits.go_to(row, self.commits_height);
+                            self.pick();
                         }
                     }
                     Pane::New => {
@@ -1182,8 +1343,11 @@ impl App {
                     self.scroll_to_ruler(cell as usize);
                 }
             }
-            MouseEventKind::Drag(MouseButton::Left) if let Some(index) = self.drag => {
-                self.drag_divider(index, at.x);
+            MouseEventKind::Drag(MouseButton::Left) if let Some(divider) = self.drag => {
+                match divider {
+                    Divider::Column(index) => self.drag_divider(index, at.x),
+                    Divider::Split => self.drag_split(at.y),
+                }
             }
             MouseEventKind::Drag(MouseButton::Left) if let Some(pane) = self.selecting => {
                 self.extend_selection(pane, at);
@@ -1333,6 +1497,14 @@ impl App {
             self.move_selection(direction);
             return;
         }
+        // The wheel over the commits scrolls them and nothing else: it never
+        // moves the cursor, so it never picks.
+        if over == Some(Pane::Commits) {
+            self.focus = Pane::Commits;
+            let by = direction * self.config.scroll_lines as isize;
+            let _ = self.commits.scroll_by(by, &self.repo, self.commits_height);
+            return;
+        }
         self.focus_diff(over);
         self.scroll_by(direction * self.config.scroll_lines as isize);
     }
@@ -1340,7 +1512,7 @@ impl App {
     /// Follow the pointer, unless it is over the file list, which has nothing to
     /// scroll sideways and no reason to take focus from a diff gesture.
     fn focus_diff(&mut self, over: Option<Pane>) {
-        if let Some(pane) = over.filter(|pane| *pane != Pane::Files) {
+        if let Some(pane) = over.filter(|pane| !matches!(pane, Pane::Files | Pane::Commits)) {
             self.focus = pane;
         }
     }
@@ -1417,7 +1589,8 @@ impl App {
 
 fn next_pane(pane: Pane) -> Pane {
     match pane {
-        Pane::Files => Pane::Old,
+        Pane::Files => Pane::Commits,
+        Pane::Commits => Pane::Old,
         Pane::Old => Pane::New,
         Pane::New => Pane::Files,
     }
@@ -1571,7 +1744,7 @@ pub mod tests {
         assert_eq!(app.focus, Pane::Files);
 
         // `Shift+Tab` reaches every pane from every pane.
-        for expected in [Pane::Old, Pane::New, Pane::Files] {
+        for expected in [Pane::Commits, Pane::Old, Pane::New, Pane::Files] {
             app.on_key(key(KeyCode::BackTab));
             assert_eq!(app.focus, expected);
         }
@@ -1583,7 +1756,8 @@ pub mod tests {
         let mut app = fixture.app();
         app.viewport_height = 2;
         app.panes = [
-            Rect::new(0, 0, 10, 10),
+            Rect::new(0, 0, 10, 5),
+            Rect::new(0, 5, 10, 5),
             Rect::new(10, 0, 20, 10),
             Rect::new(30, 0, 20, 10),
         ];
@@ -1596,7 +1770,7 @@ pub mod tests {
         };
         fn app_column(pane: Pane) -> u16 {
             match pane {
-                Pane::Files => 2,
+                Pane::Files | Pane::Commits => 2,
                 Pane::Old => 12,
                 Pane::New => 32,
             }
@@ -1978,6 +2152,9 @@ pub mod tests {
         let scrolled = app.scroll;
         assert!(scrolled > 0, "the wheel moved the view");
 
+        // The first call may report the commit list arriving; what matters
+        // is that the view is not corrected, now or after.
+        app.clamp_scroll();
         assert!(!app.clamp_scroll(), "already in bounds, nothing to correct");
         assert_eq!(
             app.scroll, scrolled,
@@ -2388,7 +2565,8 @@ pub mod tests {
         let fixture = Fixture::new("ruler", &long, &edited);
         let mut app = fixture.app();
         app.panes = [
-            Rect::new(0, 0, 26, 12),
+            Rect::new(0, 0, 26, 6),
+            Rect::new(0, 6, 26, 6),
             Rect::new(26, 0, 32, 12),
             Rect::new(58, 0, 32, 12),
         ];
@@ -2462,7 +2640,12 @@ pub mod tests {
         let fixture = Fixture::new("ruler-column", "a\nb\nc\n", "a\nB\nc\n");
         let mut app = fixture.app();
         let pane = Rect::new(58, 0, 32, 12);
-        app.panes = [Rect::new(0, 0, 26, 12), Rect::new(26, 0, 32, 12), pane];
+        app.panes = [
+            Rect::new(0, 0, 26, 6),
+            Rect::new(0, 6, 26, 6),
+            Rect::new(26, 0, 32, 12),
+            pane,
+        ];
 
         assert_eq!(app.ruler_cell_at(Position::new(89, 1)), Some(0));
         assert_eq!(app.ruler_cell_at(Position::new(89, 10)), Some(9));
@@ -2485,7 +2668,8 @@ pub mod tests {
         let mut app = fixture.app();
         app.body = Rect::new(0, 0, 90, 10);
         app.panes = [
-            Rect::new(0, 0, 26, 10),
+            Rect::new(0, 0, 26, 5),
+            Rect::new(0, 5, 26, 5),
             Rect::new(26, 0, 32, 10),
             Rect::new(58, 0, 32, 10),
         ];
@@ -2646,7 +2830,8 @@ pub mod tests {
         let mut app = fixture.app();
         app.body = Rect::new(0, 0, 90, 12);
         app.panes = [
-            Rect::new(0, 0, 26, 12),
+            Rect::new(0, 0, 26, 6),
+            Rect::new(0, 6, 26, 6),
             Rect::new(26, 0, 32, 12),
             Rect::new(58, 0, 32, 12),
         ];
@@ -2702,16 +2887,26 @@ pub mod tests {
         let mut app = fixture.app();
         app.body = Rect::new(0, 0, 90, 10);
         app.panes = [
-            Rect::new(0, 0, 26, 10),
+            Rect::new(0, 0, 26, 5),
+            Rect::new(0, 5, 26, 5),
             Rect::new(26, 0, 32, 10),
             Rect::new(58, 0, 32, 10),
         ];
 
         // The Files pane's right border and the Old pane's left one are two
         // cells that mean the same divider.
-        assert_eq!(app.divider_at(Position::new(25, 5)), Some(0));
-        assert_eq!(app.divider_at(Position::new(26, 5)), Some(0));
-        assert_eq!(app.divider_at(Position::new(57, 5)), Some(1));
+        assert_eq!(
+            app.divider_at(Position::new(25, 5)),
+            Some(Divider::Column(0))
+        );
+        assert_eq!(
+            app.divider_at(Position::new(26, 5)),
+            Some(Divider::Column(0))
+        );
+        assert_eq!(
+            app.divider_at(Position::new(57, 5)),
+            Some(Divider::Column(1))
+        );
         assert_eq!(app.divider_at(Position::new(40, 5)), None);
         // Outside the panes there is nothing to grab.
         assert_eq!(app.divider_at(Position::new(26, 11)), None);
@@ -2721,7 +2916,10 @@ pub mod tests {
         app.panes[Pane::Old as usize] = Rect::new(0, 0, 45, 10);
         app.panes[Pane::New as usize] = Rect::new(45, 0, 45, 10);
         assert_eq!(app.divider_at(Position::new(0, 5)), None);
-        assert_eq!(app.divider_at(Position::new(45, 5)), Some(1));
+        assert_eq!(
+            app.divider_at(Position::new(45, 5)),
+            Some(Divider::Column(1))
+        );
     }
 
     /// Refinement changes how many rows sit above the viewport, so the row at
@@ -2842,7 +3040,7 @@ pub mod tests {
         let notice = app.notice.clone().unwrap_or_default();
         assert!(notice.contains("read-only"), "{notice}");
         assert!(
-            notice.contains(&second),
+            notice.contains(&second[..7]),
             "the pane's own label: {notice} vs {second}"
         );
         assert_eq!(fixture.read(), "three\n", "nothing was written");
@@ -2868,6 +3066,165 @@ pub mod tests {
         assert!(app.is_dirty(&PathBuf::from("file.txt")));
         app.on_key(ctrl('s'));
         assert_eq!(fixture.read(), "xtwo\n");
+    }
+
+    /// Picking a commit compares it in the form the command line asked for,
+    /// and the pane it was picked in stays where the reader left it.
+    #[test]
+    fn picking_a_commit_keeps_the_form_of_the_comparison() {
+        let fixture = Fixture::new("pick-shape", "one\n", "two\n");
+        fixture.git(&["commit", "-qam", "second"]);
+        let second = fixture.git(&["rev-parse", "HEAD"]).trim().to_string();
+        fixture.write("three\n");
+
+        // No revision: picking a commit shows that commit's own changes.
+        let mut app = fixture.app_with_revs(&[]);
+        app.focus = Pane::Commits;
+        app.commits_height = 8;
+        app.commits.ensure_loaded(&app.repo, 8).unwrap();
+        app.on_key(key(KeyCode::Down));
+        assert_eq!(app.commits.cursor, 1, "the cursor moved");
+        assert!(app.repo.worktree(), "and nothing was compared yet");
+
+        app.on_key(key(KeyCode::Enter));
+        assert!(!app.repo.worktree(), "a commit's own changes is read-only");
+        let short = second[..7].to_string();
+        assert_eq!(app.repo.labels(), (format!("{short}^"), short));
+        assert!(app.commits.is_target(1), "the mark is on the row picked");
+        assert_eq!(app.commits.cursor, 1, "and the cursor has not moved");
+
+        // The Working tree row is the way back.
+        app.on_key(key(KeyCode::Up));
+        app.on_key(key(KeyCode::Enter));
+        assert!(app.repo.worktree());
+        assert_eq!(app.repo.labels().0, "HEAD");
+        assert!(app.commits.is_target(0));
+
+        // A revision keeps the working tree on the right, editable.
+        let mut app = fixture.app_with_revs(&[&second]);
+        app.focus = Pane::Commits;
+        app.commits_height = 8;
+        app.commits.ensure_loaded(&app.repo, 8).unwrap();
+        app.on_key(key(KeyCode::Down));
+        app.on_key(key(KeyCode::Enter));
+        assert!(app.repo.worktree(), "still against the working tree");
+        assert_eq!(app.repo.labels().1, crate::commits::WORKING_TREE);
+    }
+
+    /// Browsing the history is free: the cursor moves without difv asking git
+    /// anything, which a root that is not a repository at all proves — every
+    /// call there would fail.
+    #[test]
+    fn moving_the_commit_cursor_asks_git_nothing() {
+        let fixture = Fixture::new("pick-free", "a\n", "b\n");
+        let mut app = fixture.app();
+        app.focus = Pane::Commits;
+        app.commits_height = 4;
+        app.commits.ensure_loaded(&app.repo, 4).unwrap();
+        let loaded = app.commits.len();
+
+        for _ in 0..10 {
+            app.on_key(key(KeyCode::Down));
+        }
+        assert_eq!(app.commits.len(), loaded, "no page was fetched");
+        assert!(app.notice.is_none(), "and nothing failed: {:?}", app.notice);
+    }
+
+    /// Unsaved edits have nowhere to live once the Current side is a commit,
+    /// so a pick that makes it one asks first — and one that does not, does
+    /// not.
+    #[test]
+    fn a_pick_asks_before_it_costs_unsaved_edits() {
+        let fixture = Fixture::new("pick-dirty", "one\n", "two\n");
+        fixture.git(&["commit", "-qam", "second"]);
+        fixture.write("three\n");
+
+        let mut app = fixture.app_with_revs(&[]);
+        app.commits_height = 8;
+        app.commits.ensure_loaded(&app.repo, 8).unwrap();
+        app.focus = Pane::New;
+        app.on_key(key(KeyCode::Char('x')));
+        assert!(app.is_dirty(&PathBuf::from("file.txt")));
+
+        app.focus = Pane::Commits;
+        app.on_key(key(KeyCode::Down));
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(app.prompt, Some(Prompt::Pick), "it asks");
+        assert!(app.repo.worktree(), "and changes nothing until answered");
+
+        app.on_key(key(KeyCode::Char('n')));
+        assert_eq!(app.prompt, None);
+        assert!(app.repo.worktree(), "`n` leaves the comparison alone");
+        assert!(app.is_dirty(&PathBuf::from("file.txt")), "and the edits");
+
+        app.on_key(key(KeyCode::Enter));
+        app.on_key(key(KeyCode::Char('y')));
+        assert!(!app.repo.worktree(), "`y` picks");
+        assert!(!app.is_dirty(&PathBuf::from("file.txt")), "and drops them");
+    }
+
+    /// A pick that leaves the working tree on the right changes only the
+    /// Before side, so the edits are still there to save.
+    #[test]
+    fn a_working_tree_pick_keeps_unsaved_edits() {
+        let fixture = Fixture::new("pick-keeps", "one\n", "two\n");
+        fixture.git(&["commit", "-qam", "second"]);
+        let second = fixture.git(&["rev-parse", "HEAD"]).trim().to_string();
+        fixture.write("three\n");
+
+        let mut app = fixture.app_with_revs(&[&second]);
+        app.commits_height = 8;
+        app.commits.ensure_loaded(&app.repo, 8).unwrap();
+        app.focus = Pane::New;
+        app.on_key(key(KeyCode::Char('x')));
+
+        app.focus = Pane::Commits;
+        app.on_key(key(KeyCode::Down));
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(app.prompt, None, "nothing to ask about");
+        assert!(app.is_dirty(&PathBuf::from("file.txt")));
+        assert_eq!(app.new_lines(), ["xthree"]);
+    }
+
+    /// The border between the Changes pane and the Commits pane is a handle
+    /// like the ones between the columns, and moves rows rather than columns.
+    #[test]
+    fn dragging_the_split_moves_rows_between_the_left_panes() {
+        let fixture = Fixture::new("split-drag", "a\n", "b\n");
+        let mut app = fixture.app();
+        app.body = Rect::new(0, 0, 90, 20);
+        app.panes = [
+            Rect::new(0, 0, 26, 10),
+            Rect::new(0, 10, 26, 10),
+            Rect::new(26, 0, 32, 20),
+            Rect::new(58, 0, 32, 20),
+        ];
+        let weights = app.weights;
+
+        // Either of the two border rows grabs it.
+        assert_eq!(app.divider_at(Position::new(10, 9)), Some(Divider::Split));
+        assert_eq!(app.divider_at(Position::new(10, 10)), Some(Divider::Split));
+        // Outside the column it is not a handle.
+        assert_eq!(app.divider_at(Position::new(40, 10)), None);
+
+        let drag = |app: &mut App, y: u16, kind: MouseEventKind| {
+            app.on_mouse(MouseEvent {
+                kind,
+                column: 10,
+                row: y,
+                modifiers: KeyModifiers::NONE,
+            })
+        };
+        drag(&mut app, 10, MouseEventKind::Down(MouseButton::Left));
+        drag(&mut app, 14, MouseEventKind::Drag(MouseButton::Left));
+        assert_eq!(app.split, [14, 6], "the Changes pane took four rows");
+        assert_eq!(app.weights, weights, "and the columns are untouched");
+
+        // Neither pane collapses past a border and a row.
+        drag(&mut app, 19, MouseEventKind::Drag(MouseButton::Left));
+        assert_eq!(app.split, [17, 3]);
+        drag(&mut app, 0, MouseEventKind::Drag(MouseButton::Left));
+        assert_eq!(app.split, [3, 17]);
     }
 
     /// The file `-C` names is looked up in the list the revisions produce, so
