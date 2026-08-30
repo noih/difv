@@ -3,7 +3,7 @@ use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
-use unicode_width::UnicodeWidthChar;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::app::{App, Pane};
 use crate::diff::{DiffRow, RowKind};
@@ -67,6 +67,32 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     draw_settings(frame, app, body);
     draw_help(frame, app, body);
     draw_footer(frame, app, footer);
+    refresh_after_wide(frame.buffer_mut());
+}
+
+/// Ratatui only writes the cells that changed between two frames, and one
+/// cell it can get wrong is the one after a wide glyph's own right half. A CJK
+/// line moving one cell left puts each glyph over the cell its right half was
+/// in; the terminal drops the old glyph and blanks the half that is left over
+/// — one cell further on — but keeps that cell's background. Ratatui never
+/// writes it: in both of its buffers that cell is the blank after a wide
+/// glyph, so nothing has changed. What stays on screen is a block of the
+/// line's colour, one per cell the pane moved, which a divider drag, a
+/// `Ctrl+B` or a scroll scatters across a CJK diff.
+///
+/// The cell is asked for on every frame instead. Only the blank cell two on
+/// from a wide glyph, so a CJK-heavy pane costs a few dozen cells a frame, and
+/// a frame is drawn on input alone.
+fn refresh_after_wide(buf: &mut ratatui::buffer::Buffer) {
+    use ratatui::buffer::{Cell, CellDiffOption};
+    let area = buf.area;
+    for y in area.top()..area.bottom() {
+        for x in area.left()..area.right().saturating_sub(2) {
+            if buf[(x, y)].symbol().width() > 1 && buf[(x + 2, y)] == Cell::EMPTY {
+                buf[(x + 2, y)].set_diff_option(CellDiffOption::AlwaysUpdate);
+            }
+        }
+    }
 }
 
 /// Every key difv answers to, except the two the footer already shows: this
@@ -765,6 +791,109 @@ mod tests {
         let open = terminal.backend().to_string();
         assert!(open.contains("Keys"), "{open}");
         assert!(open.contains("Hide / show the file list"), "{open}");
+    }
+
+    /// What a terminal shows after ratatui's diff is applied to it. Ratatui's
+    /// `TestBackend` sets cells one by one; a terminal does not. A wide glyph
+    /// there covers two cells, and a write over either half blanks the other
+    /// while keeping its background — which is what a diff that never revisits
+    /// that half leaves on screen as a stray block. The model is that rule and
+    /// nothing else.
+    struct Terminal {
+        width: usize,
+        /// Per cell: the background, and which cell's glyph covers it.
+        cells: Vec<(ratatui::style::Color, Option<usize>)>,
+    }
+
+    impl Terminal {
+        fn new(width: usize, height: usize) -> Self {
+            Self {
+                width,
+                cells: vec![(ratatui::style::Color::Reset, None); width * height],
+            }
+        }
+
+        fn apply(&mut self, updates: &[(u16, u16, &ratatui::buffer::Cell)]) {
+            for (x, y, cell) in updates {
+                let at = *y as usize * self.width + *x as usize;
+                let wide = cell.symbol().width() > 1;
+                for i in at..=at + wide as usize {
+                    // Whatever glyph was covering this cell loses its other half.
+                    if let Some(other) = self.cells[i].1 {
+                        self.cells[other].1 = None;
+                    }
+                    self.cells[i].1 = None;
+                }
+                self.cells[at] = (cell.bg, None);
+                if wide {
+                    self.cells[at + 1] = (cell.bg, Some(at));
+                    self.cells[at].1 = Some(at + 1);
+                }
+            }
+        }
+
+        /// The cells whose background is not what `wanted` would show.
+        fn wrong(&self, wanted: &ratatui::buffer::Buffer) -> Vec<(usize, usize)> {
+            let mut wrong = Vec::new();
+            let mut covered = None;
+            for (i, cell) in wanted.content.iter().enumerate() {
+                let want = match covered.take() {
+                    Some(bg) => bg,
+                    None => {
+                        if cell.symbol().width() > 1 {
+                            covered = Some(cell.bg);
+                        }
+                        cell.bg
+                    }
+                };
+                if self.cells[i].0 != want {
+                    wrong.push((i % self.width, i / self.width));
+                }
+            }
+            wrong
+        }
+    }
+
+    /// A pane moving one cell to the left slides every wide glyph on it over
+    /// the cell the glyph's own right half used to be in. The terminal blanks
+    /// what is left of the old glyph — its right half, one cell further on —
+    /// but keeps that cell's background, and ratatui's diff never writes that
+    /// cell: in both of its buffers it is the blank that follows a wide glyph.
+    /// The block that leaves behind is what a divider drag, a `Ctrl+B` or a
+    /// scroll scatters over a CJK diff.
+    #[test]
+    fn a_pane_moving_a_cell_leaves_no_stray_background_behind() {
+        use crate::app::tests::Fixture;
+        use ratatui::backend::TestBackend;
+
+        let fixture = Fixture::new("wide-shift", "a\n", "加入的一行。\n");
+        let mut app = fixture.app();
+        let (width, height) = (140, 8);
+        let mut terminal = ratatui::Terminal::new(TestBackend::new(width, height)).unwrap();
+        let mut render = |app: &mut App| {
+            let mut copy = None;
+            terminal
+                .draw(|frame| {
+                    draw(frame, app);
+                    copy = Some(frame.buffer_mut().clone());
+                })
+                .unwrap();
+            copy.unwrap()
+        };
+
+        // Weights that sum to the width are cell widths; the second layout
+        // moves the Before and Current panes one cell left each.
+        app.weights = [30, 50, 60];
+        let before = render(&mut app);
+        app.weights = [29, 50, 61];
+        let after = render(&mut app);
+
+        let mut screen = Terminal::new(width as usize, height as usize);
+        screen.apply(&ratatui::buffer::Buffer::empty(before.area).diff(&before));
+        assert!(screen.wrong(&before).is_empty(), "the first frame is whole");
+        screen.apply(&before.diff(&after));
+        let wrong = screen.wrong(&after);
+        assert!(wrong.is_empty(), "stray background at (x, y): {wrong:?}");
     }
 
     /// The file list carries an unsaved mark too, but `Ctrl+B` hides it, and the
