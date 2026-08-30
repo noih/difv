@@ -781,6 +781,59 @@ mod tests {
         assert_eq!(now.new_content(&file).text(), "three\n");
     }
 
+    /// The blob ids have to be whole, not a prefix: `--raw` abbreviates by
+    /// default, and a fixed width would be a prefix under SHA-256. Pinned with
+    /// a SHA-256 repository, where a 40-character id is the tell.
+    #[test]
+    fn blob_ids_are_whole_under_sha256() {
+        let dir = std::env::temp_dir().join(format!("difv-sha256-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let git = |args: &[&str]| {
+            let out = Command::new("git")
+                .arg("-C")
+                .arg(&dir)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}: {out:?}");
+        };
+        git(&["init", "-q", "--object-format=sha256"]);
+        git(&["config", "user.email", "t@difv"]);
+        git(&["config", "user.name", "difv"]);
+        std::fs::write(dir.join("file.txt"), "one\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "init"]);
+        std::fs::write(dir.join("file.txt"), "two\n").unwrap();
+
+        let repo = Repo::discover(&dir).unwrap().with_revs(Vec::new()).unwrap();
+        let files = repo.changed_files().unwrap();
+        let id = files[0].old_blob.as_deref().unwrap();
+        assert_eq!(id.len(), 64, "{id}");
+        assert_eq!(repo.old_content(&files[0]), "one\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// No revision is difv's own default, and settling it must not cost a git
+    /// call: pinned by asking on a root that is not a repository at all, where
+    /// any call would fail.
+    #[test]
+    fn no_revision_asks_git_nothing() {
+        let dir = std::env::temp_dir().join(format!("difv-norev-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let repo = Repo::at(dir.clone()).with_revs(Vec::new()).unwrap();
+        assert!(repo.worktree());
+        assert!(
+            Repo::at(dir.clone())
+                .with_revs(vec![OsString::from("HEAD")])
+                .is_err(),
+            "a revision, by contrast, is git's to settle"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A revision git cannot resolve is refused in git's own words, with the
     /// prefix difv's own `difv: ` replaces taken off.
     #[test]
