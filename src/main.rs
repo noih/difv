@@ -74,14 +74,14 @@ fn parse_args<I: IntoIterator<Item = OsString>>(args: I) -> Args {
     let (mut revs, mut path) = (Vec::new(), None);
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
-        // A leading `-` is what separates a flag from a revision. A name difv
-        // cannot decode cannot be a flag, so it goes down the revision side
-        // untouched — and whatever follows `-C` is a path whatever it starts
-        // with, which is the escape hatch for a file named like a flag.
-        if let Some(text) = arg.to_str()
-            && text.starts_with('-')
-        {
-            match text {
+        // A leading `-` is what separates a flag from a revision, whatever
+        // the rest of the argument is: one difv cannot decode is still refused
+        // rather than handed to git, where `--output=…` would be obeyed. What
+        // follows `-C` is a path whatever it starts with, which is the escape
+        // hatch for a file named like a flag.
+        let text = arg.to_string_lossy();
+        if text.starts_with('-') {
+            match text.as_ref() {
                 "-V" | "--version" => return Args::Version,
                 "-h" | "--help" => return Args::Help,
                 "-C" => {
@@ -409,11 +409,19 @@ mod tests {
     }
 
     /// An argument difv cannot decode is an argument all the same — a
-    /// revision git can refuse for itself, or a path.
+    /// revision git can refuse for itself, or a path — unless it starts with
+    /// `-`, which makes it a flag difv does not know, never a revision git
+    /// might obey as an option.
     #[test]
     #[cfg(unix)]
     fn an_undecodable_argument_is_an_argument() {
         use std::os::unix::ffi::OsStringExt;
+        let flag = OsString::from_vec(b"--output=x\xff".to_vec());
+        let Args::Error(refused) = parse_args([flag]) else {
+            panic!("a flag difv cannot decode is still a flag");
+        };
+        assert!(refused.starts_with("unknown argument"), "{refused}");
+
         let bad = OsString::from_vec(vec![0xff, 0xfe, b'x']);
         assert_eq!(
             parse_args([bad.clone()]),
@@ -485,11 +493,15 @@ mod tests {
             format!("not a git repository: {}", outside.display())
         );
 
-        let previous = std::env::current_dir().unwrap();
-        std::env::set_current_dir(&outside).unwrap();
-        let nothing = open_repo(&classify(None));
-        std::env::set_current_dir(previous).unwrap();
-        let Err(message) = nothing else {
+        // No `-C` at all, run from outside a repository: there is nothing to
+        // name. Built by hand rather than by changing the process's directory,
+        // which every other test would share.
+        let nothing = Target {
+            typed: None,
+            start: outside.clone(),
+            file: None,
+        };
+        let Err(message) = open_repo(&nothing) else {
             panic!("no argument outside a repository is refused");
         };
         assert_eq!(message, "not a git repository", "nothing to name");

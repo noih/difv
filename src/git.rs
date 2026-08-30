@@ -50,9 +50,6 @@ pub struct Repo {
     /// The revision arguments as typed. Empty means difv's own default of
     /// `HEAD` against the working tree.
     revs: Vec<OsString>,
-    /// What `git diff` is actually given, which differs from `revs` only in a
-    /// repository whose `HEAD` has no commit yet.
-    diff_revs: Vec<OsString>,
     /// Whether the Current side is the working tree, which is what makes it
     /// editable, polled and able to hold untracked files.
     worktree: bool,
@@ -76,7 +73,6 @@ impl Repo {
         Ok(Self {
             root: PathBuf::from(root),
             revs: Vec::new(),
-            diff_revs: Vec::new(),
             worktree: true,
         })
     }
@@ -93,6 +89,11 @@ impl Repo {
     /// which has no parent to exclude and so really is a comparison against
     /// the working tree.
     pub fn with_revs(mut self, revs: Vec<OsString>) -> Result<Self> {
+        // No revision is difv's own default, which nothing needs git to
+        // settle — and the one case where startup should cost what it did.
+        if revs.is_empty() {
+            return Ok(self);
+        }
         let mut args: Vec<&OsStr> = vec![OsStr::new("rev-parse"), OsStr::new("--revs-only")];
         args.extend(revs.iter().map(OsString::as_os_str));
         args.push(OsStr::new("--"));
@@ -108,30 +109,8 @@ impl Repo {
             );
         }
         self.worktree = String::from_utf8_lossy(&out.stdout).lines().count() <= 1;
-        self.diff_revs = if revs.is_empty() {
-            vec![self.default_base()?]
-        } else {
-            revs.clone()
-        };
         self.revs = revs;
         Ok(self)
-    }
-
-    /// What difv compares against with no revision given. `HEAD` — except in a
-    /// repository whose first commit has not been made, where `git diff HEAD`
-    /// refuses and the empty tree is what makes every file an addition, which
-    /// is what difv showed there before it used `git diff` at all. The id is
-    /// asked for rather than written down because it depends on the
-    /// repository's hash algorithm.
-    fn default_base(&self) -> Result<OsString> {
-        if self
-            .git(&["rev-parse", "--verify", "--quiet", "HEAD"])
-            .is_ok()
-        {
-            return Ok(OsString::from("HEAD"));
-        }
-        let empty = self.git(&["hash-object", "-t", "tree", "/dev/null"])?;
-        Ok(OsString::from(String::from_utf8(empty)?.trim().to_string()))
     }
 
     pub fn worktree(&self) -> bool {
@@ -168,7 +147,6 @@ impl Repo {
         Self {
             root,
             revs: Vec::new(),
-            diff_revs: vec![OsString::from("HEAD")],
             worktree: true,
         }
     }
@@ -226,13 +204,19 @@ impl Repo {
     /// list them, difv always has, and they only exist when the working tree
     /// is a side.
     pub fn changed_files(&self) -> Result<Vec<ChangedFile>> {
-        let mut args: Vec<OsString> = ["diff", "--raw", "-z", "-M", "--abbrev=40"]
-            .iter()
-            .map(OsString::from)
-            .collect();
-        args.extend(self.diff_revs.iter().cloned());
-        args.push(OsString::from("--"));
-        let mut files = parse_raw_z(&self.git(&args)?);
+        let raw = match self.revs.is_empty() {
+            false => self.diff_raw(&self.revs)?,
+            // `git diff HEAD` refuses in a repository whose first commit has
+            // not been made, where difv has always shown every file as an
+            // addition — which is what the empty tree compares as. Settled on
+            // every listing rather than once, so the first commit made while
+            // difv is open shows up on `r` like any other.
+            true => match self.diff_raw(&[OsString::from("HEAD")]) {
+                Ok(raw) => raw,
+                Err(_) => self.diff_raw(&[self.empty_tree()?])?,
+            },
+        };
+        let mut files = parse_raw_z(&raw);
         if self.worktree {
             let out = self.git(&["ls-files", "--others", "--exclude-standard", "-z"])?;
             files.extend(
@@ -249,6 +233,23 @@ impl Repo {
         }
         files.sort_by(|a, b| a.path.cmp(&b.path));
         Ok(files)
+    }
+
+    fn diff_raw(&self, revs: &[OsString]) -> Result<Vec<u8>> {
+        let mut args: Vec<OsString> = ["diff", "--raw", "-z", "-M", "--no-abbrev"]
+            .iter()
+            .map(OsString::from)
+            .collect();
+        args.extend(revs.iter().cloned());
+        args.push(OsString::from("--"));
+        self.git(&args)
+    }
+
+    /// The id of the tree with nothing in it, asked for rather than written
+    /// down because it depends on the repository's hash algorithm.
+    fn empty_tree(&self) -> Result<OsString> {
+        let id = self.git(&["hash-object", "-t", "tree", "/dev/null"])?;
+        Ok(OsString::from(String::from_utf8(id)?.trim().to_string()))
     }
 
     /// The Before side is only ever displayed, so undecodable bytes are shown
@@ -830,6 +831,24 @@ mod tests {
             ]
         );
         assert_eq!(repo.labels().0, "HEAD", "the title still says HEAD");
+
+        // The first commit, made while difv is open, is what the next listing
+        // compares against: what was committed is no longer a change.
+        git(&[
+            "-c",
+            "user.email=t@difv",
+            "-c",
+            "user.name=difv",
+            "commit",
+            "-qm",
+            "first",
+        ]);
+        let files = repo.changed_files().unwrap();
+        let got: Vec<String> = files
+            .iter()
+            .map(|f| f.path.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(got, ["loose.txt"]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
