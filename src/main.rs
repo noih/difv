@@ -42,94 +42,153 @@ use git::Repo;
 /// clicking and no scrolling at all.
 const MOUSE_ON: &str = "\x1b[?1000h\x1b[?1002h\x1b[?1015h\x1b[?1006h";
 
-/// difv always compares `HEAD` against the working tree, so the only thing a
-/// command line has to say is which repository — and, at most, which file to
-/// start on. Parsing is kept away from the filesystem and the terminal so it
-/// can be tested as the table of outcomes it is.
+/// difv's command line is `git diff`'s, so that nothing about it has to be
+/// learned twice: up to two revisions and at most one path. Parsing is kept
+/// away from the filesystem and the terminal so it can be tested as the table
+/// of outcomes it is — which is also why it stops at collecting words rather
+/// than deciding which of them are revisions, a question only the disk and git
+/// can answer.
 #[derive(Debug, PartialEq, Eq)]
 enum Args {
     Version,
     Help,
-    Open(PathBuf),
+    Open {
+        /// Positionals before `--`, each still either a revision or a path.
+        words: Vec<OsString>,
+        /// Positionals after `--`, which can only be paths.
+        paths: Vec<OsString>,
+    },
     Error(String),
 }
 
-/// Arguments are taken as `OsString`, not `String`: a path is what this takes
-/// now, and a path is not required to be UTF-8 anywhere difv runs. Refusing
-/// one is fine; panicking inside `std::env::args()` on a file name the user
-/// can see in their own shell is not.
+/// Arguments are taken as `OsString`, not `String`: a path is one of the
+/// things this takes, and a path is not required to be UTF-8 anywhere difv
+/// runs. Refusing one is fine; panicking inside `std::env::args()` on a file
+/// name the user can see in their own shell is not.
 fn parse_args<I: IntoIterator<Item = OsString>>(args: I) -> Args {
-    let mut args = args.into_iter();
-    let Some(first) = args.next() else {
-        return Args::Open(PathBuf::from("."));
-    };
-    // A leading `-` is what separates a flag from a path, so a file whose name
-    // starts with one is reached as `./-name` — the usual escape hatch, and
-    // cheaper than a `--` separator nobody will type. A name difv cannot decode
-    // cannot be a flag either, so it goes down the path side untouched.
-    if let Some(text) = first.to_str()
-        && text.starts_with('-')
-    {
-        return match text {
-            "-V" | "--version" => Args::Version,
-            "-h" | "--help" => Args::Help,
-            other => Args::Error(format!("unknown argument `{other}` — try `difv --help`")),
-        };
+    let (mut words, mut paths) = (Vec::new(), Vec::new());
+    let mut separated = false;
+    for arg in args {
+        // A leading `-` is what separates a flag from an argument, so a file
+        // whose name starts with one is reached as `./-name` or past `--`,
+        // which is git's own escape hatch. A name difv cannot decode cannot be
+        // a flag either, so it goes down the positional side untouched.
+        if !separated
+            && let Some(text) = arg.to_str()
+            && text.starts_with('-')
+        {
+            match text {
+                "--" => separated = true,
+                "-V" | "--version" => return Args::Version,
+                "-h" | "--help" => return Args::Help,
+                other => {
+                    return Args::Error(format!("unknown argument `{other}` — try `difv --help`"));
+                }
+            }
+            continue;
+        }
+        if arg.is_empty() {
+            return Args::Error("empty argument — try `difv --help`".to_string());
+        }
+        match separated {
+            true => paths.push(arg),
+            false => words.push(arg),
+        }
     }
-    if first.is_empty() {
-        return Args::Error("empty path — try `difv --help`".to_string());
-    }
-    if args.next().is_some() {
-        return Args::Error("at most one path — try `difv --help`".to_string());
-    }
-    Args::Open(PathBuf::from(first))
+    Args::Open { words, paths }
 }
 
-/// Where difv starts: the path as it was typed, kept for what difv says about
-/// it; the directory to discover the repository from; and the file to select
-/// once the repository is known.
+/// Where difv starts: the arguments still to be told apart, the paths that
+/// already are, and the directory to discover the repository from — which has
+/// to be settled first, since a revision means nothing until there is a
+/// repository to resolve it in.
 struct Target {
-    typed: PathBuf,
+    words: Vec<OsString>,
+    paths: Vec<OsString>,
     start: PathBuf,
+}
+
+/// What difv ended up being asked for, once git has been consulted.
+struct Asked {
+    revs: Vec<OsString>,
     file: Option<PathBuf>,
 }
 
-/// Anything that is not a directory is taken as a file, including a path that
-/// is not on disk at all: a file git reports as deleted is one of the things
-/// difv is most often opened on, and it is only the changed-file list that can
-/// tell that case from a typo. Whether the path exists is settled there, once
-/// the list is in hand — and until then the walk up to a directory that does
-/// exist is what keeps a deletion that took the whole directory openable.
-fn classify(typed: PathBuf) -> Target {
-    if typed.is_dir() {
-        return Target {
-            start: typed.clone(),
-            typed,
-            file: None,
-        };
-    }
-    let start = git::nearest_existing_dir(&typed)
-        .map(|(dir, _)| dir)
-        .unwrap_or(Path::new("."))
-        .to_path_buf();
+/// The directory to search for the repository from: the first argument that
+/// says anything about where on disk it is. A revision says nothing — `HEAD~1`
+/// has no parent directory but the current one — and neither does a path in
+/// the current directory, so both leave the search where it would have started
+/// anyway. The walk up to a directory that does exist is what keeps a deletion
+/// that took the whole directory openable.
+fn classify(words: Vec<OsString>, paths: Vec<OsString>) -> Target {
+    let start = paths
+        .iter()
+        .chain(words.iter())
+        .find_map(|arg| {
+            let path = Path::new(arg);
+            if path.is_dir() {
+                return Some(path.to_path_buf());
+            }
+            git::nearest_existing_dir(path)
+                .map(|(dir, _)| dir)
+                .filter(|dir| *dir != Path::new("."))
+                .map(Path::to_path_buf)
+        })
+        .unwrap_or_else(|| PathBuf::from("."));
     Target {
+        words,
+        paths,
         start,
-        file: Some(typed.clone()),
-        typed,
     }
 }
 
+/// Which of the arguments were revisions. On disk means a path, as it does to
+/// git; not on disk means a revision if git can resolve it. An argument that
+/// is neither is taken as a path anyway, because the changed-file list is the
+/// only thing that can tell a file git reports as deleted from a typo, and
+/// opening a deleted file by name is one of the things difv is for.
+fn split(target: Target, repo: &Repo) -> Result<Asked, String> {
+    let mut revs = Vec::new();
+    let mut files: Vec<PathBuf> = target.paths.iter().map(PathBuf::from).collect();
+    for word in target.words {
+        let on_disk = Path::new(&word).exists();
+        if on_disk && repo.is_revision(&word) {
+            return Err(format!(
+                "ambiguous argument `{}`: both revision and filename — use `--` to separate paths from revisions",
+                word.to_string_lossy()
+            ));
+        }
+        match !on_disk && repo.is_revision(&word) {
+            true => revs.push(word),
+            false => files.push(PathBuf::from(word)),
+        }
+    }
+    if files.len() > 1 {
+        return Err("at most one path — try `difv --help`".to_string());
+    }
+    if revs.len() > 2 {
+        return Err("at most two revisions — try `difv --help`".to_string());
+    }
+    // A directory only says which repository, which is already known by now.
+    let file = files.pop().filter(|path| !path.is_dir());
+    Ok(Asked { revs, file })
+}
+
 /// The repository the command line asked for. Discovery is what fails when the
-/// path is wrong, but the message has to name the path the user typed rather
-/// than whichever ancestor the walk above stopped at — and a path that is not
-/// there at all is a different mistake from one that is outside a repository.
+/// path is wrong, but the message has to name the argument the user typed
+/// rather than whichever ancestor the walk above stopped at — and an argument
+/// that is on disk nowhere is a different mistake from a path that is outside
+/// a repository. Nothing here can say whether such an argument was meant as a
+/// revision, so the message covers both.
 fn open_repo(target: &Target) -> Result<Repo, String> {
     Repo::discover(&target.start).map_err(|_| {
-        let path = target.typed.display();
-        match (target.typed.exists(), target.typed == Path::new(".")) {
-            (_, true) => "not a git repository".to_string(),
-            (true, _) => format!("not a git repository: {path}"),
-            (false, _) => format!("no such path: {path}"),
+        let candidates = || target.paths.iter().chain(target.words.iter());
+        if let Some(existing) = candidates().find(|arg| Path::new(arg).exists()) {
+            return format!("not a git repository: {}", Path::new(existing).display());
+        }
+        match candidates().next() {
+            Some(arg) => format!("no such path or revision: {}", Path::new(arg).display()),
+            None => "not a git repository".to_string(),
         }
     })
 }
@@ -150,11 +209,17 @@ fn main() -> Result<()> {
         Args::Help => {
             println!(
                 "difv {}\n{}\n\n\
-                 Usage: difv [PATH]\n\n\
-                 Run it inside a Git repository, or give it a path to one. A\n\
-                 directory picks the repository; a file picks the repository and\n\
+                 Usage: difv [<rev>] [<rev>] [--] [PATH]\n\n\
+                 The revisions mean what they mean to `git diff`:\n\n\
+                 \x20 difv               HEAD against the working tree\n\
+                 \x20 difv <rev>         that revision against the working tree\n\
+                 \x20 difv <rev>^!       what that commit changed\n\
+                 \x20 difv <a>..<b>      one revision against another\n\n\
+                 A revision on the right is read-only; the working tree is not.\n\n\
+                 PATH picks the repository, and a file picks the repository and\n\
                  opens on that file. Either way the whole repository's changes are\n\
-                 listed, so a subdirectory does not narrow them.\n\n\
+                 listed, so a subdirectory does not narrow them. `--` separates a\n\
+                 path from a revision when a name could be either.\n\n\
                  \x20 -h, --help       this\n\
                  \x20 -V, --version    the version\n\n\
                  Press `?` inside for the keys, `,` for the settings.\n\n\
@@ -166,11 +231,21 @@ fn main() -> Result<()> {
             return Ok(());
         }
         Args::Error(message) => refuse(&message),
-        Args::Open(path) => classify(path),
+        Args::Open { words, paths } => classify(words, paths),
     };
     let repo = match open_repo(&target) {
         Ok(repo) => repo,
         Err(message) => refuse(&message),
+    };
+    let asked = match split(target, &repo) {
+        Ok(asked) => asked,
+        Err(message) => refuse(&message),
+    };
+    // Git's own message for a revision it cannot resolve: the wording the user
+    // already knows, and one difv could only paraphrase worse.
+    let repo = match repo.with_revs(asked.revs) {
+        Ok(repo) => repo,
+        Err(err) => refuse(&err.to_string()),
     };
     // Both of these run before the alternate screen so their output lands on a
     // normal terminal rather than a torn-down TUI.
@@ -178,7 +253,7 @@ fn main() -> Result<()> {
     for warning in &warnings {
         eprintln!("difv: {warning}");
     }
-    let mut app = match App::new(config, repo, target.file.as_deref()) {
+    let mut app = match App::new(config, repo, asked.file.as_deref()) {
         Ok(app) => app,
         Err(err) => refuse(&err.to_string()),
     };
@@ -296,21 +371,40 @@ mod tests {
         parse_args(args.iter().map(OsString::from))
     }
 
-    /// One optional path, and everything a `-` starts still means what it did.
+    fn open(words: &[&str]) -> Args {
+        Args::Open {
+            words: words.iter().map(OsString::from).collect(),
+            paths: Vec::new(),
+        }
+    }
+
+    fn one(path: &Path) -> Target {
+        classify(vec![OsString::from(path)], Vec::new())
+    }
+
+    /// Positionals are collected, not classified — that needs the disk and git
+    /// — and everything a `-` starts still means what it did, `--` aside.
     #[test]
-    fn the_command_line_is_at_most_one_path() {
-        assert_eq!(parse(&[]), Args::Open(PathBuf::from(".")));
+    fn the_command_line_collects_positionals_and_flags() {
+        assert_eq!(parse(&[]), open(&[]));
         assert_eq!(parse(&["-V"]), Args::Version);
         assert_eq!(parse(&["--version"]), Args::Version);
         assert_eq!(parse(&["-h"]), Args::Help);
         assert_eq!(parse(&["--help"]), Args::Help);
+        assert_eq!(parse(&["src/auth.ts"]), open(&["src/auth.ts"]));
+        assert_eq!(parse(&["main..feature"]), open(&["main..feature"]));
         assert_eq!(
-            parse(&["src/auth.ts"]),
-            Args::Open(PathBuf::from("src/auth.ts"))
+            parse(&["main", "src/auth.ts"]),
+            open(&["main", "src/auth.ts"])
         );
+
+        // Everything past `--` can only be a path, whatever it looks like.
         assert_eq!(
-            parse(&["/abs/repo"]),
-            Args::Open(PathBuf::from("/abs/repo"))
+            parse(&["main", "--", "-weird-name"]),
+            Args::Open {
+                words: vec![OsString::from("main")],
+                paths: vec![OsString::from("-weird-name")],
+            }
         );
 
         let Args::Error(unknown) = parse(&["--frobnicate"]) else {
@@ -321,67 +415,166 @@ mod tests {
             "{unknown}"
         );
 
-        let Args::Error(two) = parse(&["src", "tests"]) else {
-            panic!("a second path is refused");
-        };
-        assert!(two.contains("at most one path"), "{two}");
-
         let Args::Error(empty) = parse(&[""]) else {
-            panic!("an empty path is refused");
+            panic!("an empty argument is refused");
         };
-        assert!(empty.contains("empty path"), "{empty}");
+        assert!(empty.contains("empty argument"), "{empty}");
     }
 
-    /// A path difv cannot decode is a path all the same — refusing it is fine,
-    /// panicking inside the argument iterator is not.
+    /// An argument difv cannot decode is an argument all the same — refusing
+    /// it is fine, panicking inside the argument iterator is not.
     #[test]
     #[cfg(unix)]
-    fn an_undecodable_path_is_a_path() {
+    fn an_undecodable_argument_is_an_argument() {
         use std::os::unix::ffi::OsStringExt;
         let bad = OsString::from_vec(vec![0xff, 0xfe, b'x']);
-        assert_eq!(parse_args([bad.clone()]), Args::Open(PathBuf::from(bad)));
+        assert_eq!(
+            parse_args([bad.clone()]),
+            Args::Open {
+                words: vec![bad],
+                paths: Vec::new(),
+            }
+        );
     }
 
     /// A deletion that took the directory with it leaves neither the file nor
     /// its parent to start from, and that is exactly when the file is worth
-    /// opening by name. The walk has to reach the repository above them.
+    /// opening by name. The walk has to reach the repository above them — and
+    /// an argument that says nothing about the disk has to leave it alone.
     #[test]
     fn classification_walks_up_to_a_directory_that_exists() {
         let fixture = app::tests::Fixture::new("classify", "a\n", "b\n");
         let root = fixture.dir();
 
-        let dir = classify(root.to_path_buf());
-        assert_eq!(dir.start, root, "a directory is its own starting point");
-        assert_eq!(dir.file, None);
-
-        let file = classify(root.join("file.txt"));
-        assert_eq!(file.start, root, "a file starts from its directory");
-        assert_eq!(file.file.as_deref(), Some(root.join("file.txt").as_path()));
-
-        let gone = classify(root.join("src/deep/auth.ts"));
-        assert_eq!(gone.start, root, "past two directories that are not there");
         assert_eq!(
-            gone.file.as_deref(),
-            Some(root.join("src/deep/auth.ts").as_path())
+            one(root).start,
+            root,
+            "a directory is its own starting point"
+        );
+        assert_eq!(
+            one(&root.join("file.txt")).start,
+            root,
+            "a file starts from its directory"
+        );
+        assert_eq!(
+            one(&root.join("src/deep/auth.ts")).start,
+            root,
+            "past two directories that are not there"
+        );
+        assert_eq!(
+            classify(vec![OsString::from("HEAD~1")], Vec::new()).start,
+            Path::new("."),
+            "a revision says nothing about where on disk to look"
         );
     }
 
-    /// Whatever the walk had to settle for, the refusal names the path the
+    /// Which arguments were revisions, once there is a repository to ask.
+    #[test]
+    fn arguments_are_told_apart_by_the_disk_and_by_git() {
+        let fixture = app::tests::Fixture::new("split", "a\n", "b\n");
+        let root = fixture.dir();
+        let repo = Repo::discover(root).unwrap();
+        let head = fixture.git(&["rev-parse", "HEAD"]).trim().to_string();
+        let split_of = |words: Vec<&str>| {
+            split(
+                classify(words.iter().map(OsString::from).collect(), Vec::new()),
+                &repo,
+            )
+        };
+
+        let Ok(plain) = split_of(vec![]) else {
+            panic!("no argument at all is fine")
+        };
+        assert!(plain.revs.is_empty() && plain.file.is_none());
+
+        let file = root.join("file.txt");
+        let Ok(both) = split_of(vec![&head, file.to_str().unwrap()]) else {
+            panic!("a revision and a path are both allowed")
+        };
+        assert_eq!(both.revs, vec![OsString::from(&head)]);
+        assert_eq!(both.file.as_deref(), Some(file.as_path()));
+
+        // A directory only says which repository, so nothing is selected.
+        let Ok(dir) = split_of(vec![root.to_str().unwrap()]) else {
+            panic!("a directory is a path")
+        };
+        assert_eq!(dir.file, None);
+
+        // A range is one argument and still one revision to difv.
+        let Ok(range) = split_of(vec![&format!("{head}^!")]) else {
+            panic!("a range is a revision")
+        };
+        assert_eq!(range.revs.len(), 1);
+
+        // Neither on disk nor a revision: a path, so the changed-file list can
+        // still recognise a file git reports as deleted.
+        let Ok(gone) = split_of(vec!["src/deep/auth.ts"]) else {
+            panic!("an unresolvable argument is taken as a path")
+        };
+        assert_eq!(gone.file.as_deref(), Some(Path::new("src/deep/auth.ts")));
+
+        let Err(two) = split_of(vec![root.to_str().unwrap(), file.to_str().unwrap()]) else {
+            panic!("a second path is refused");
+        };
+        assert!(two.contains("at most one path"), "{two}");
+
+        let Err(three) = split_of(vec![&head, &head, &head]) else {
+            panic!("a third revision is refused");
+        };
+        assert!(three.contains("at most two revisions"), "{three}");
+    }
+
+    /// A name that is both a branch and a file is git's own ambiguity, and
+    /// difv refuses it the way git does, pointing at the same way out.
+    #[test]
+    fn an_argument_that_is_both_a_revision_and_a_file_is_refused() {
+        let fixture = app::tests::Fixture::new("ambiguous", "a\n", "b\n");
+        fixture.git(&["branch", "file.txt"]);
+        let repo = Repo::discover(fixture.dir()).unwrap();
+        let words = vec![OsString::from("file.txt")];
+
+        // Run from inside the repository, so the name is on disk as well.
+        let previous = std::env::current_dir().unwrap();
+        std::env::set_current_dir(fixture.dir()).unwrap();
+        let ambiguous = split(classify(words.clone(), Vec::new()), &repo);
+        let separated = split(classify(Vec::new(), words), &repo);
+        std::env::set_current_dir(previous).unwrap();
+
+        let Err(message) = ambiguous else {
+            panic!("a name that is both is refused");
+        };
+        assert!(
+            message.starts_with("ambiguous argument `file.txt`"),
+            "{message}"
+        );
+        assert!(message.contains("`--`"), "{message}");
+
+        let Ok(asked) = separated else {
+            panic!("past `--` it is only a path");
+        };
+        assert!(asked.revs.is_empty());
+        assert_eq!(asked.file.as_deref(), Some(Path::new("file.txt")));
+    }
+
+    /// Whatever the walk had to settle for, the refusal names the argument the
     /// user typed — and says which of the two mistakes it was.
     #[test]
-    fn a_refusal_names_the_path_that_was_typed() {
+    fn a_refusal_names_the_argument_that_was_typed() {
         let outside = std::env::temp_dir().join(format!("difv-refuse-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&outside);
         std::fs::create_dir_all(&outside).unwrap();
 
-        let missing = classify(outside.join("nope/deeper.txt"));
+        let missing = one(&outside.join("nope/deeper.txt"));
         let Err(message) = open_repo(&missing) else {
             panic!("a path outside a repository is refused");
         };
-        assert!(message.starts_with("no such path: "), "{message}");
+        assert!(
+            message.starts_with("no such path or revision: "),
+            "{message}"
+        );
         assert!(message.ends_with("nope/deeper.txt"), "{message}");
 
-        let there = classify(outside.clone());
+        let there = one(&outside);
         let Err(message) = open_repo(&there) else {
             panic!("a directory outside a repository is refused");
         };
@@ -389,6 +582,15 @@ mod tests {
             message,
             format!("not a git repository: {}", outside.display())
         );
+
+        let previous = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&outside).unwrap();
+        let nothing = open_repo(&classify(Vec::new(), Vec::new()));
+        std::env::set_current_dir(previous).unwrap();
+        let Err(message) = nothing else {
+            panic!("no argument outside a repository is refused");
+        };
+        assert_eq!(message, "not a git repository", "nothing to name");
         let _ = std::fs::remove_dir_all(&outside);
     }
 

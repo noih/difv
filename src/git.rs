@@ -1,4 +1,5 @@
 use anyhow::{Result, bail};
+use std::ffi::{OsStr, OsString};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -29,10 +30,32 @@ pub struct ChangedFile {
     pub path: PathBuf,
     pub old_path: Option<PathBuf>,
     pub status: Status,
+    /// The blob on the Before side, `None` where there is none — a file added
+    /// between the two sides. Reading content by id rather than by
+    /// `<rev>:<path>` is one object lookup instead of a tree walk, and needs no
+    /// arithmetic about which path a rename had on which side.
+    pub old_blob: Option<String>,
+    /// The blob on the Current side. `None` for a deletion, and meaningless
+    /// when the Current side is the working tree — `git diff` reports either
+    /// zeroes or the index's blob there, neither of which is what is on disk.
+    pub new_blob: Option<String>,
 }
 
+/// What difv compares, and where. The revisions are held as they were typed:
+/// difv never parses revision syntax — `a..b`, `a...b`, `a^!`, `@{u}` and
+/// everything else `gitrevisions` allows work because git resolves them, and
+/// the pane titles say what the user wrote rather than a resolved id.
 pub struct Repo {
     root: PathBuf,
+    /// The revision arguments as typed. Empty means difv's own default of
+    /// `HEAD` against the working tree.
+    revs: Vec<OsString>,
+    /// What `git diff` is actually given, which differs from `revs` only in a
+    /// repository whose `HEAD` has no commit yet.
+    diff_revs: Vec<OsString>,
+    /// Whether the Current side is the working tree, which is what makes it
+    /// editable, polled and able to hold untracked files.
+    worktree: bool,
 }
 
 impl Repo {
@@ -52,12 +75,117 @@ impl Repo {
         let root = String::from_utf8(out.stdout)?.trim().to_string();
         Ok(Self {
             root: PathBuf::from(root),
+            revs: Vec::new(),
+            diff_revs: Vec::new(),
+            worktree: true,
         })
+    }
+
+    /// The revisions to compare, in the repository already discovered — a
+    /// revision means nothing until there is a repository to resolve it in.
+    ///
+    /// Which side the working tree is on is git's own rule, not a reading of
+    /// the syntax: `git diff` compares against the working tree when the
+    /// arguments name exactly one commit, and one commit is what
+    /// `rev-parse --revs-only` prints one line for. That covers the forms difv
+    /// would otherwise have to know about — `a..b` and `a^!` are one argument
+    /// and two lines, `a b` is two of each — including a root commit's `^!`,
+    /// which has no parent to exclude and so really is a comparison against
+    /// the working tree.
+    pub fn with_revs(mut self, revs: Vec<OsString>) -> Result<Self> {
+        let mut args: Vec<&OsStr> = vec![OsStr::new("rev-parse"), OsStr::new("--revs-only")];
+        args.extend(revs.iter().map(OsString::as_os_str));
+        args.push(OsStr::new("--"));
+        let out = self.run(&args)?;
+        if !out.status.success() {
+            // Git's own wording, which is the wording the user knows, minus
+            // the prefix difv's own `difv: ` replaces.
+            let message = String::from_utf8_lossy(&out.stderr);
+            let message = message.trim();
+            bail!(
+                "{}",
+                message.strip_prefix("fatal: ").unwrap_or(message).trim()
+            );
+        }
+        self.worktree = String::from_utf8_lossy(&out.stdout).lines().count() <= 1;
+        self.diff_revs = if revs.is_empty() {
+            vec![self.default_base()?]
+        } else {
+            revs.clone()
+        };
+        self.revs = revs;
+        Ok(self)
+    }
+
+    /// What difv compares against with no revision given. `HEAD` — except in a
+    /// repository whose first commit has not been made, where `git diff HEAD`
+    /// refuses and the empty tree is what makes every file an addition, which
+    /// is what difv showed there before it used `git diff` at all. The id is
+    /// asked for rather than written down because it depends on the
+    /// repository's hash algorithm.
+    fn default_base(&self) -> Result<OsString> {
+        if self
+            .git(&["rev-parse", "--verify", "--quiet", "HEAD"])
+            .is_ok()
+        {
+            return Ok(OsString::from("HEAD"));
+        }
+        let empty = self.git(&["hash-object", "-t", "tree", "/dev/null"])?;
+        Ok(OsString::from(String::from_utf8(empty)?.trim().to_string()))
+    }
+
+    /// Whether git can resolve this argument as a revision — including the
+    /// range forms, which is why this is not `rev-parse --verify`. The `--`
+    /// keeps a name that is also a file from being taken as a path, so the
+    /// answer is about the revision alone.
+    pub fn is_revision(&self, arg: &OsStr) -> bool {
+        let args = [
+            OsStr::new("rev-parse"),
+            OsStr::new("--revs-only"),
+            arg,
+            OsStr::new("--"),
+        ];
+        self.run(&args)
+            .is_ok_and(|out| out.status.success() && !out.stdout.is_empty())
+    }
+
+    pub fn worktree(&self) -> bool {
+        self.worktree
+    }
+
+    /// What the two panes are looking at, for their titles. Derived from the
+    /// text the user typed: the name they think in is the name they should
+    /// read back, and the merge base `a...b` compares against has no short
+    /// name to offer anyway.
+    pub fn labels(&self) -> (String, String) {
+        let typed: Vec<String> = self
+            .revs
+            .iter()
+            .map(|r| r.to_string_lossy().into_owned())
+            .collect();
+        let (old, new) = match typed.as_slice() {
+            [] => ("HEAD".to_string(), WORKING_TREE.to_string()),
+            [one] => split_revision(one),
+            [a, b] => (a.clone(), b.clone()),
+            _ => (typed.join(" "), "Current".to_string()),
+        };
+        // One argument can still name one commit — a plain revision always
+        // does, a root commit's `^!` does too — and then the Current side is
+        // the working tree whatever the syntax suggested.
+        match self.worktree {
+            true => (old, WORKING_TREE.to_string()),
+            false => (old, new),
+        }
     }
 
     #[cfg(test)]
     pub fn at(root: PathBuf) -> Self {
-        Self { root }
+        Self {
+            root,
+            revs: Vec::new(),
+            diff_revs: vec![OsString::from("HEAD")],
+            worktree: true,
+        }
     }
 
     #[cfg(test)]
@@ -80,45 +208,92 @@ impl Repo {
         Some(base.join(rest).strip_prefix(root).ok()?.to_path_buf())
     }
 
-    fn git(&self, args: &[&str]) -> Result<Vec<u8>> {
-        let out = Command::new("git")
+    /// The command as run, whether or not it succeeded — for the callers that
+    /// have something to say about a failure themselves.
+    fn run<S: AsRef<OsStr>>(&self, args: &[S]) -> Result<std::process::Output> {
+        Ok(Command::new("git")
             .arg("-C")
             .arg(&self.root)
             .args(args)
-            .output()?;
+            .output()?)
+    }
+
+    fn git<S: AsRef<OsStr>>(&self, args: &[S]) -> Result<Vec<u8>> {
+        let out = self.run(args)?;
         if !out.status.success() {
+            let shown: Vec<String> = args
+                .iter()
+                .map(|a| a.as_ref().to_string_lossy().into_owned())
+                .collect();
             bail!(
                 "git {:?}: {}",
-                args,
+                shown,
                 String::from_utf8_lossy(&out.stderr).trim()
             );
         }
         Ok(out.stdout)
     }
 
-    /// Working tree compared against HEAD, including untracked files.
+    /// Every file that differs between the two sides. `git diff --raw` is what
+    /// can name arbitrary sides — `git status` only ever knew one pair — and
+    /// it reports the blob on each side, which is what the content below is
+    /// read by. Untracked files are difv's own addition: `git diff` does not
+    /// list them, difv always has, and they only exist when the working tree
+    /// is a side.
     pub fn changed_files(&self) -> Result<Vec<ChangedFile>> {
-        let out = self.git(&["status", "--porcelain=v1", "-z", "--untracked-files=all"])?;
-        Ok(parse_porcelain_z(&out))
+        let mut args: Vec<OsString> = ["diff", "--raw", "-z", "-M", "--abbrev=40"]
+            .iter()
+            .map(OsString::from)
+            .collect();
+        args.extend(self.diff_revs.iter().cloned());
+        args.push(OsString::from("--"));
+        let mut files = parse_raw_z(&self.git(&args)?);
+        if self.worktree {
+            let out = self.git(&["ls-files", "--others", "--exclude-standard", "-z"])?;
+            files.extend(
+                out.split(|b| *b == 0)
+                    .filter(|r| !r.is_empty())
+                    .map(|r| ChangedFile {
+                        path: bytes_to_path(r),
+                        old_path: None,
+                        status: Status::Added,
+                        old_blob: None,
+                        new_blob: None,
+                    }),
+            );
+        }
+        files.sort_by(|a, b| a.path.cmp(&b.path));
+        Ok(files)
     }
 
-    /// HEAD is only ever displayed, so undecodable bytes are shown lossily
-    /// rather than refused.
-    pub fn head_content(&self, f: &ChangedFile) -> String {
-        if f.status == Status::Added {
+    /// The Before side is only ever displayed, so undecodable bytes are shown
+    /// lossily rather than refused.
+    pub fn old_content(&self, f: &ChangedFile) -> String {
+        let Some(id) = &f.old_blob else {
             return String::new();
-        }
-        let p = f.old_path.as_ref().unwrap_or(&f.path);
-        let spec = format!("HEAD:{}", p.display());
-        match self.git(&["show", &spec]).map(FileContent::decode) {
+        };
+        match self.git(&["cat-file", "blob", id]).map(FileContent::decode) {
             Ok(FileContent::Text(text)) => text.body,
             _ => String::new(),
         }
     }
 
-    pub fn worktree_content(&self, f: &ChangedFile) -> FileContent {
+    /// The Current side: the file on disk when the working tree is what is
+    /// being compared, and the blob otherwise. The blob is never read for the
+    /// working tree even when `git diff` reported one, because what it reports
+    /// there is the index's copy, not what the editor would be editing.
+    pub fn new_content(&self, f: &ChangedFile) -> FileContent {
         if f.status == Status::Deleted {
             return FileContent::Missing;
+        }
+        if !self.worktree {
+            let Some(id) = &f.new_blob else {
+                return FileContent::Missing;
+            };
+            return match self.git(&["cat-file", "blob", id]) {
+                Ok(bytes) => FileContent::decode(bytes),
+                Err(_) => FileContent::Missing,
+            };
         }
         match std::fs::read(self.abs(&f.path)) {
             Ok(bytes) => FileContent::decode(bytes),
@@ -242,41 +417,91 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     result
 }
 
-/// Git writes `XY PATH\0` per entry; renames and copies add a second
-/// `ORIG_PATH\0` record straight after the entry that names them.
-fn parse_porcelain_z(buf: &[u8]) -> Vec<ChangedFile> {
+/// The Current pane's label when it is the working tree rather than a
+/// revision.
+const WORKING_TREE: &str = "Working Tree";
+
+/// The two sides one revision argument names, for the pane titles. The order
+/// matters: `...` has to be tried before `..`, which is a prefix of it. An
+/// omitted end of a range is `HEAD`, as it is to git.
+fn split_revision(rev: &str) -> (String, String) {
+    let end = |text: &str| match text.is_empty() {
+        true => "HEAD".to_string(),
+        false => text.to_string(),
+    };
+    if let Some((a, b)) = rev.split_once("...") {
+        return (end(a), end(b));
+    }
+    if let Some((a, b)) = rev.split_once("..") {
+        return (end(a), end(b));
+    }
+    if let Some(base) = rev.strip_suffix("^!") {
+        return (format!("{base}^"), base.to_string());
+    }
+    (rev.to_string(), WORKING_TREE.to_string())
+}
+
+/// `git diff --raw -z` writes one `:<old mode> <new mode> <old id> <new id>
+/// <status>\0` record per file, followed by its path — or, for a rename or a
+/// copy, by the old path and then the new one. An id of all zeroes means
+/// there is no blob on that side.
+fn parse_raw_z(buf: &[u8]) -> Vec<ChangedFile> {
     let records: Vec<&[u8]> = buf.split(|b| *b == 0).filter(|r| !r.is_empty()).collect();
     let mut files = Vec::new();
     let mut i = 0;
     while i < records.len() {
-        let rec = records[i];
+        let head = records[i];
         i += 1;
-        if rec.len() < 4 {
+        let Some(rest) = head.strip_prefix(b":") else {
             continue;
-        }
-        let (x, y) = (rec[0] as char, rec[1] as char);
-        let path = bytes_to_path(&rec[3..]);
-        let mut old_path = None;
-        if (x == 'R' || x == 'C')
-            && let Some(orig) = records.get(i)
-        {
-            old_path = Some(bytes_to_path(orig));
-            i += 1;
-        }
-        let status = match (x, y) {
-            ('?', _) | ('A', _) => Status::Added,
-            ('D', _) | (_, 'D') => Status::Deleted,
-            ('R', _) | ('C', _) => Status::Renamed,
-            _ => Status::Modified,
+        };
+        let text = String::from_utf8_lossy(rest);
+        let mut fields = text.split(' ').skip(2);
+        let (Some(old_id), Some(new_id), Some(letter)) = (
+            fields.next(),
+            fields.next(),
+            fields.next().and_then(|f| f.chars().next()),
+        ) else {
+            continue;
+        };
+        let renamed = letter == 'R' || letter == 'C';
+        // A rename's two path records are its old path and then its new one;
+        // every other status has just the one.
+        let Some(first) = records.get(i) else {
+            break;
+        };
+        i += 1;
+        let (old_path, path) = match renamed {
+            true => {
+                let Some(second) = records.get(i) else {
+                    break;
+                };
+                i += 1;
+                (Some(bytes_to_path(first)), bytes_to_path(second))
+            }
+            false => (None, bytes_to_path(first)),
         };
         files.push(ChangedFile {
             path,
             old_path,
-            status,
+            status: match letter {
+                'A' => Status::Added,
+                'D' => Status::Deleted,
+                'R' | 'C' => Status::Renamed,
+                _ => Status::Modified,
+            },
+            old_blob: blob_id(old_id),
+            new_blob: blob_id(new_id),
         });
     }
     files.sort_by(|a, b| a.path.cmp(&b.path));
     files
+}
+
+/// An id of all zeroes is git's way of saying there is no blob on that side —
+/// a file added, deleted, or (as `git diff` reports it) not in the index.
+fn blob_id(id: &str) -> Option<String> {
+    (!id.is_empty() && !id.chars().all(|c| c == '0')).then(|| id.to_string())
 }
 
 fn bytes_to_path(b: &[u8]) -> PathBuf {
@@ -417,36 +642,214 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// One `--raw` record per file, with the rename's two paths and the score
+    /// on its status letter, and an all-zero id meaning no blob on that side.
     #[test]
-    fn parses_statuses_and_renames() {
-        let raw = b"M  src/auth.ts\0 M src/user.ts\0A  src/utils.ts\0 D src/old.ts\0R  new.ts\0old.ts\0?? untracked.ts\0";
-        let files = parse_porcelain_z(raw);
-        let got: Vec<(&str, Status, Option<&str>)> = files
+    fn parses_statuses_renames_and_blobs() {
+        let raw = b":100644 100644 aaa1 bbb1 M\0src/auth.ts\0\
+                    :000000 100644 0000 ccc1 A\0src/utils.ts\0\
+                    :100644 000000 ddd1 0000 D\0src/old.ts\0\
+                    :100644 100644 eee1 eee1 R100\0old.ts\0new.ts\0\
+                    :100644 100644 fff1 0000000 M\0src/my file.ts\0";
+        let got: Vec<String> = parse_raw_z(raw)
             .iter()
             .map(|f| {
-                (
-                    f.path.to_str().unwrap(),
-                    f.status,
-                    f.old_path.as_deref().and_then(|p| p.to_str()),
+                format!(
+                    "{} {} {:?} {:?} {:?}",
+                    f.status.letter(),
+                    f.path.display(),
+                    f.old_path.as_ref().map(|p| p.display().to_string()),
+                    f.old_blob,
+                    f.new_blob,
                 )
             })
             .collect();
         assert_eq!(
             got,
-            vec![
-                ("new.ts", Status::Renamed, Some("old.ts")),
-                ("src/auth.ts", Status::Modified, None),
-                ("src/old.ts", Status::Deleted, None),
-                ("src/user.ts", Status::Modified, None),
-                ("src/utils.ts", Status::Added, None),
-                ("untracked.ts", Status::Added, None),
+            [
+                r#"R new.ts Some("old.ts") Some("eee1") Some("eee1")"#,
+                r#"M src/auth.ts None Some("aaa1") Some("bbb1")"#,
+                // A path with a space is one record like any other, and the
+                // zero id on the right is what the working tree reports.
+                r#"M src/my file.ts None Some("fff1") None"#,
+                r#"D src/old.ts None Some("ddd1") None"#,
+                r#"A src/utils.ts None None Some("ccc1")"#,
             ]
         );
     }
 
+    /// The pane titles say what was typed. `...` has to be tried before `..`,
+    /// and an omitted end of a range is `HEAD`, as it is to git.
     #[test]
-    fn handles_paths_with_spaces() {
-        let files = parse_porcelain_z(b"M  src/my file.ts\0");
-        assert_eq!(files[0].path.to_str().unwrap(), "src/my file.ts");
+    fn revision_labels_name_both_sides() {
+        let cases = [
+            ("main", ("main", WORKING_TREE)),
+            ("main..feature", ("main", "feature")),
+            ("main...feature", ("main", "feature")),
+            ("abc123^!", ("abc123^", "abc123")),
+            ("..feature", ("HEAD", "feature")),
+            ("main..", ("main", "HEAD")),
+        ];
+        for (rev, want) in cases {
+            let (old, new) = split_revision(rev);
+            assert_eq!((old.as_str(), new.as_str()), want, "{rev}");
+        }
+    }
+
+    /// The pane labels through a `Repo`, where one argument naming one commit
+    /// means the working tree is the Current side whatever the syntax said.
+    #[test]
+    fn labels_follow_which_side_the_working_tree_is_on() {
+        let fixture = crate::app::tests::Fixture::new("labels", "a\n", "b\n");
+        let head = fixture.git(&["rev-parse", "HEAD"]).trim().to_string();
+        let repo = |revs: &[&str]| {
+            Repo::discover(fixture.dir())
+                .unwrap()
+                .with_revs(revs.iter().map(OsString::from).collect())
+                .unwrap()
+        };
+
+        assert_eq!(
+            repo(&[]).labels(),
+            ("HEAD".to_string(), WORKING_TREE.to_string())
+        );
+        assert_eq!(
+            repo(&["HEAD"]).labels(),
+            ("HEAD".to_string(), WORKING_TREE.to_string())
+        );
+        // The one commit there is has no parent, so `^!` names one commit and
+        // git diffs it against the working tree — the title has to agree.
+        assert_eq!(repo(&[&format!("{head}^!")]).labels().1, WORKING_TREE);
+    }
+
+    /// The whole point of the revision arguments: what each form compares,
+    /// which side the working tree is on, and where the content comes from.
+    #[test]
+    fn revisions_choose_what_is_compared() {
+        let fixture = crate::app::tests::Fixture::new("revisions", "one\n", "one\n");
+        fixture.write("two\n");
+        fixture.write_file("added.txt", "added\n");
+        fixture.git(&["add", "-A"]);
+        fixture.git(&["commit", "-qm", "second"]);
+        let second = fixture.git(&["rev-parse", "HEAD"]).trim().to_string();
+        let first = fixture.git(&["rev-parse", "HEAD~1"]).trim().to_string();
+        fixture.write("three\n");
+        fixture.write_file("untracked.txt", "loose\n");
+
+        let open = |revs: &[&str]| {
+            Repo::discover(fixture.dir())
+                .unwrap()
+                .with_revs(revs.iter().map(OsString::from).collect())
+                .unwrap()
+        };
+        let names = |repo: &Repo| {
+            repo.changed_files()
+                .unwrap()
+                .iter()
+                .map(|f| f.path.to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+        };
+
+        // No revision, and one revision, are both against the working tree —
+        // which is what puts the untracked file in the list.
+        let now = open(&[]);
+        assert!(now.worktree());
+        assert_eq!(names(&now), ["file.txt", "untracked.txt"]);
+        let since_first = open(&[&first]);
+        assert!(since_first.worktree());
+        assert_eq!(
+            names(&since_first),
+            ["added.txt", "file.txt", "untracked.txt"]
+        );
+
+        // Two revisions, in every form, compare two commits: no untracked
+        // file, and the Current side is a blob rather than the disk.
+        for revs in [
+            vec![format!("{second}^!")],
+            vec![format!("{first}..{second}")],
+            vec![first.clone(), second.clone()],
+        ] {
+            let borrowed: Vec<&str> = revs.iter().map(String::as_str).collect();
+            let repo = open(&borrowed);
+            assert!(!repo.worktree(), "{revs:?}");
+            assert_eq!(names(&repo), ["added.txt", "file.txt"], "{revs:?}");
+            let file = repo
+                .changed_files()
+                .unwrap()
+                .into_iter()
+                .find(|f| f.path == Path::new("file.txt"))
+                .unwrap();
+            assert_eq!(repo.old_content(&file), "one\n", "{revs:?}");
+            assert_eq!(repo.new_content(&file).text(), "two\n", "{revs:?}");
+        }
+
+        // The same file against the working tree reads what is on disk, not
+        // the blob `git diff` reported for it.
+        let file = now
+            .changed_files()
+            .unwrap()
+            .into_iter()
+            .find(|f| f.path == Path::new("file.txt"))
+            .unwrap();
+        assert_eq!(now.old_content(&file), "two\n");
+        assert_eq!(now.new_content(&file).text(), "three\n");
+    }
+
+    /// A revision git cannot resolve is refused in git's own words, and one it
+    /// can is recognised whatever its form.
+    #[test]
+    fn a_bad_revision_is_refused_in_gits_words() {
+        let fixture = crate::app::tests::Fixture::new("bad-rev", "a\n", "b\n");
+        let repo = Repo::discover(fixture.dir()).unwrap();
+
+        assert!(repo.is_revision(OsStr::new("HEAD")));
+        assert!(repo.is_revision(OsStr::new("HEAD^!")));
+        assert!(!repo.is_revision(OsStr::new("nope")));
+        assert!(!repo.is_revision(OsStr::new("file.txt")));
+
+        let Err(err) = repo.with_revs(vec![OsString::from("nope")]) else {
+            panic!("a revision git cannot resolve is refused");
+        };
+        let err = err.to_string();
+        assert!(err.contains("nope"), "{err}");
+        assert!(!err.starts_with("fatal: "), "{err}");
+    }
+
+    /// `git diff HEAD` refuses before the first commit, where difv has always
+    /// shown every file as an addition. The empty tree is what keeps it doing
+    /// that.
+    #[test]
+    fn a_repository_with_no_commits_lists_its_files_as_added() {
+        let dir = std::env::temp_dir().join(format!("difv-nocommit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let git = |args: &[&str]| {
+            Command::new("git")
+                .arg("-C")
+                .arg(&dir)
+                .args(args)
+                .output()
+                .unwrap()
+        };
+        git(&["init", "-q"]);
+        std::fs::write(dir.join("staged.txt"), "a\n").unwrap();
+        std::fs::write(dir.join("loose.txt"), "b\n").unwrap();
+        git(&["add", "staged.txt"]);
+
+        let repo = Repo::discover(&dir).unwrap().with_revs(Vec::new()).unwrap();
+        let files = repo.changed_files().unwrap();
+        let got: Vec<(String, Status)> = files
+            .iter()
+            .map(|f| (f.path.to_string_lossy().into_owned(), f.status))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("loose.txt".to_string(), Status::Added),
+                ("staged.txt".to_string(), Status::Added),
+            ]
+        );
+        assert_eq!(repo.labels().0, "HEAD", "the title still says HEAD");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -152,7 +152,7 @@ impl App {
             .and_then(|rel| self.files.iter().position(|f| f.path == rel));
         match index {
             Some(index) => self.select(index),
-            None if !path.exists() => bail!("no such path: {}", path.display()),
+            None if !path.exists() => bail!("no such path or revision: {}", path.display()),
             None => {
                 self.notice = Some(format!("{} has no changes", path.display()));
                 self.notice_until = Some(Instant::now() + NOTICE_TTL);
@@ -281,17 +281,19 @@ impl App {
         };
         let head: Vec<String> = self
             .repo
-            .head_content(&file)
+            .old_content(&file)
             .lines()
             .map(str::to_string)
             .collect();
-        let content = self.repo.worktree_content(&file);
+        let content = self.repo.new_content(&file);
         self.disk_stamp = self.stamp(&file);
         self.stale = false;
         self.old_selection = None;
 
         self.readonly.clear();
-        match content.editable() {
+        // A revision on the Current side is read-only for the same reason a
+        // binary file is: there is nothing on disk that saving it would mean.
+        match content.editable().filter(|_| self.repo.worktree()) {
             Some(text) => {
                 self.buffers
                     .entry(file.path.clone())
@@ -827,6 +829,10 @@ impl App {
             KeyCode::Char(',') => self.settings = Some(0),
             KeyCode::Char('?') => self.help = true,
             KeyCode::Char('b') if ctrl => self.toggle_files(),
+            // Saving is the editor's key, and stays the editor's key — except
+            // where there can be no editor to press it in, which is exactly
+            // where pressing it deserves an answer rather than silence.
+            KeyCode::Char('s') if ctrl && !self.repo.worktree() => self.save(),
             KeyCode::Esc => self.focus = self.home_pane(),
             // `Tab` belongs to the editor. Letting it also cycle panes means it
             // silently changes meaning at the end of the cycle, which is worse
@@ -979,12 +985,20 @@ impl App {
         let Some(file) = self.selected_file().cloned() else {
             return;
         };
+        // Saving a revision would have nowhere to write. `Ctrl+S` on a file
+        // that simply has no buffer is already silent; a whole side that can
+        // never have one deserves to say why.
+        if !self.repo.worktree() {
+            self.notice = Some(format!("{} is read-only", self.repo.labels().1));
+            self.notice_until = Some(Instant::now() + NOTICE_TTL);
+            return;
+        }
         let Some(buffer) = self.buffers.get(&file.path) else {
             return;
         };
         // Compare content rather than timestamps: an mtime that has not moved,
         // or a same-size rewrite, would let us destroy another process's work.
-        let on_disk = self.repo.worktree_content(&file);
+        let on_disk = self.repo.new_content(&file);
         let matches = on_disk
             .editable()
             .is_some_and(|text| text.body == buffer.loaded_body());
@@ -1009,7 +1023,13 @@ impl App {
         }
     }
 
+    /// What the disk poll compares. `None` when the Current side is a
+    /// revision: the disk is not what is shown, so a write to it is not a
+    /// change to anything difv is displaying.
     fn stamp(&self, file: &ChangedFile) -> Option<(SystemTime, u64)> {
+        if !self.repo.worktree() {
+            return None;
+        }
         let meta = std::fs::metadata(self.repo.abs(&file.path)).ok()?;
         Some((meta.modified().ok()?, meta.len()))
     }
@@ -1440,6 +1460,12 @@ pub mod tests {
             &self.dir
         }
 
+        /// For the tests that need a second file, or more history than the one
+        /// commit `new` builds.
+        pub fn write_file(&self, name: &str, body: &str) {
+            std::fs::write(self.dir.join(name), body).unwrap();
+        }
+
         pub fn app(&self) -> App {
             let repo = Repo::at(self.dir.clone());
             let files = repo.changed_files().unwrap();
@@ -1450,15 +1476,30 @@ pub mod tests {
             app
         }
 
+        /// The same, comparing whatever the command line would have asked for
+        /// rather than `HEAD` against the working tree.
+        pub fn app_with_revs(&self, revs: &[&str]) -> App {
+            let repo = Repo::discover(&self.dir)
+                .unwrap()
+                .with_revs(revs.iter().map(std::ffi::OsString::from).collect())
+                .unwrap();
+            let files = repo.changed_files().unwrap();
+            assert!(!files.is_empty(), "fixture must leave something to compare");
+            let mut app = App::with(repo, files, Config::default());
+            app.viewport_height = 20;
+            app.focus = Pane::New;
+            app
+        }
+
         fn read(&self) -> String {
             std::fs::read_to_string(self.dir.join("file.txt")).unwrap()
         }
 
-        fn write(&self, text: &str) {
+        pub fn write(&self, text: &str) {
             std::fs::write(self.dir.join("file.txt"), text).unwrap();
         }
 
-        fn git(&self, args: &[&str]) -> String {
+        pub fn git(&self, args: &[&str]) -> String {
             let out = Command::new("git")
                 .arg("-C")
                 .arg(&self.dir)
@@ -2776,5 +2817,77 @@ pub mod tests {
         // Focus alone cannot make it editable, so keys stay view commands.
         app.on_key(key(KeyCode::Char('q')));
         assert!(app.quit);
+    }
+
+    /// Two revisions have no working tree to write to, so the Current pane is
+    /// read-only the way a binary file is — and says so when asked to save,
+    /// which a file that simply has no buffer never had to.
+    #[test]
+    fn a_revision_on_the_current_side_is_read_only() {
+        let fixture = Fixture::new("revision-readonly", "one\n", "one\n");
+        fixture.write("two\n");
+        fixture.git(&["commit", "-qam", "second"]);
+        let second = fixture.git(&["rev-parse", "HEAD"]).trim().to_string();
+        fixture.write("three\n");
+
+        let mut app = fixture.app_with_revs(&[&format!("{second}^!")]);
+        assert_eq!(app.new_lines(), ["two"], "the commit's own content");
+        assert!(app.buffer().is_none() && !app.editing());
+
+        app.on_key(key(KeyCode::Char('x')));
+        assert_eq!(app.new_lines(), ["two"], "typing changes nothing");
+        assert!(!app.is_dirty(&PathBuf::from("file.txt")));
+
+        app.on_key(ctrl('s'));
+        let notice = app.notice.clone().unwrap_or_default();
+        assert!(notice.contains("read-only"), "{notice}");
+        assert!(
+            notice.contains(&second),
+            "the pane's own label: {notice} vs {second}"
+        );
+        assert_eq!(fixture.read(), "three\n", "nothing was written");
+
+        // The disk is not what is shown, so a write to it is not a change to
+        // anything on screen.
+        fixture.write("four\n");
+        app.poll_disk();
+        assert!(!app.stale);
+        assert_eq!(app.new_lines(), ["two"]);
+    }
+
+    /// One revision still compares against the working tree, so everything the
+    /// editor does keeps working.
+    #[test]
+    fn one_revision_leaves_the_working_tree_editable() {
+        let fixture = Fixture::new("revision-editable", "one\n", "two\n");
+        let head = fixture.git(&["rev-parse", "HEAD"]).trim().to_string();
+
+        let mut app = fixture.app_with_revs(&[&head]);
+        assert!(app.editing());
+        app.on_key(key(KeyCode::Char('x')));
+        assert!(app.is_dirty(&PathBuf::from("file.txt")));
+        app.on_key(ctrl('s'));
+        assert_eq!(fixture.read(), "xtwo\n");
+    }
+
+    /// A file argument is looked up in the list the revisions produce, so a
+    /// file a commit touched can be opened by name whether or not it still
+    /// differs from `HEAD`.
+    #[test]
+    fn a_file_argument_selects_from_the_compared_list() {
+        let fixture = Fixture::new("revision-select", "one\n", "one\n");
+        fixture.write_file("other.txt", "other\n");
+        fixture.write("two\n");
+        fixture.git(&["add", "-A"]);
+        fixture.git(&["commit", "-qm", "second"]);
+        let second = fixture.git(&["rev-parse", "HEAD"]).trim().to_string();
+
+        let mut app = fixture.app_with_revs(&[&format!("{second}^!")]);
+        app.select_path(&fixture.dir().join("other.txt")).unwrap();
+        assert_eq!(
+            app.selected_file().map(|f| f.path.clone()),
+            Some(PathBuf::from("other.txt")),
+        );
+        assert!(app.notice.is_none(), "it is in the list, so no notice");
     }
 }

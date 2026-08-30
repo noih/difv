@@ -34,10 +34,24 @@ Apple Silicon macOS and Linux. `git` has to be on your `PATH`.
 
 ## Use
 
-Run `difv` inside a Git repository, or `difv <path>` to point it at one you are
-not standing in. A directory only says which repository — the list is the whole
-repository's changes either way — and a file says which repository *and* which
-file to open on.
+Run `difv` inside a Git repository and it shows what `git diff HEAD` would, with
+an editor on the right. The arguments are `git diff`'s too, so there is nothing
+new to learn:
+
+```bash
+difv                 # HEAD against the working tree
+difv main            # a revision against the working tree
+difv 3d8cab3^!       # what one commit changed
+difv main..feature   # one revision against another
+```
+
+Anything `git` accepts as a revision works, because `git` is what resolves it.
+A revision on the right is read-only; the working tree is not.
+
+`difv <path>` points it at a repository you are not standing in. A directory only
+says which repository — the list is the whole repository's changes either way —
+and a file says which repository *and* which file to open on. Put `--` before a
+path whose name is also a branch.
 
 - Click, scroll, or arrow around; drag a border to resize; drag to select and
   `Ctrl+C` to copy from either side; right-click a file to copy its path. The

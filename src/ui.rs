@@ -299,8 +299,9 @@ fn draw_files(frame: &mut Frame, app: &mut App, area: Rect) {
 
 fn draw_side(frame: &mut Frame, app: &App, area: Rect, side: Pane) {
     let old_side = side == Pane::Old;
+    let (old_label, new_label) = app.repo.labels();
     let (title, lines_src) = if old_side {
-        ("HEAD / Before".to_string(), &app.diff.old[..])
+        (format!("{old_label} / Before"), &app.diff.old[..])
     } else {
         // The file list marks unsaved work too, but `Ctrl+B` hides it — and the
         // pane holding the edits is the last place that mark should disappear
@@ -310,7 +311,7 @@ fn draw_side(frame: &mut Frame, app: &App, area: Rect, side: Pane) {
             .is_some_and(|file| app.is_dirty(&file.path));
         let mark = if dirty { DIRTY_MARK } else { "" };
         (
-            format!("{mark} Working Tree / Current")
+            format!("{mark} {new_label} / Current")
                 .trim_start()
                 .to_string(),
             app.new_lines(),
@@ -796,6 +797,44 @@ mod tests {
         ));
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
         assert!(!terminal.backend().to_string().contains("* Working Tree"));
+    }
+
+    /// The titles say what is being compared, so a revision comparison is not
+    /// mistaken for the working tree.
+    #[test]
+    fn the_pane_titles_name_what_they_compare() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let fixture = crate::app::tests::Fixture::new("titles", "one\n", "one\n");
+        fixture.write("two\n");
+        fixture.git(&["commit", "-qam", "second"]);
+        let second = fixture
+            .git(&["rev-parse", "--short", "HEAD"])
+            .trim()
+            .to_string();
+        fixture.write("three\n");
+
+        let mut terminal = Terminal::new(TestBackend::new(100, 12)).unwrap();
+        let mut shown = |app: &mut App| {
+            terminal.draw(|frame| draw(frame, app)).unwrap();
+            terminal.backend().to_string()
+        };
+
+        let plain = shown(&mut fixture.app_with_revs(&[]));
+        assert!(plain.contains("HEAD / Before"), "{plain}");
+        assert!(plain.contains("Working Tree / Current"), "{plain}");
+
+        let one = shown(&mut fixture.app_with_revs(&[&second]));
+        assert!(one.contains(&format!("{second} / Before")), "{one}");
+        assert!(one.contains("Working Tree / Current"), "{one}");
+
+        let range = shown(&mut fixture.app_with_revs(&[&format!("HEAD~1..{second}")]));
+        assert!(range.contains("HEAD~1 / Before"), "{range}");
+        assert!(range.contains(&format!("{second} / Current")), "{range}");
+        // A revision on the right is read-only, so it never carries the mark
+        // an unsaved buffer would.
+        assert!(!range.contains(DIRTY_MARK), "{range}");
     }
 
     /// A terminal shorter than a panel must scroll it, not hide the rows below
