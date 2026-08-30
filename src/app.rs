@@ -1326,7 +1326,8 @@ impl App {
             // The gesture is "take this", not "go here": the row under the
             // pointer is copied and the selection stays where it was.
             MouseEventKind::Down(MouseButton::Right) if over == Some(Pane::Files) => {
-                let offset = mouse.row.saturating_sub(self.panes[0].y + 1) as usize;
+                let top = self.panes[Pane::Files as usize].y + 1;
+                let offset = mouse.row.saturating_sub(top) as usize;
                 if let Some(file) = self.files.get(self.file_state.offset() + offset) {
                     let path = file.path.display().to_string();
                     clipboard::copy(&path);
@@ -1583,7 +1584,7 @@ impl App {
     }
 
     fn pane_at(&self, at: Position) -> Option<Pane> {
-        [Pane::Files, Pane::Old, Pane::New]
+        [Pane::Files, Pane::Commits, Pane::Old, Pane::New]
             .into_iter()
             .find(|pane| self.panes[*pane as usize].contains(at))
     }
@@ -3186,6 +3187,60 @@ pub mod tests {
         assert_eq!(app.prompt, None, "nothing to ask about");
         assert!(app.is_dirty(&PathBuf::from("file.txt")));
         assert_eq!(app.new_lines(), ["xthree"]);
+    }
+
+    /// The Commits pane is under the pointer like any other: a click on a
+    /// row picks it in one step, and the wheel scrolls without picking.
+    #[test]
+    fn clicking_a_commit_picks_it() {
+        let fixture = Fixture::new("pick-click", "one\n", "two\n");
+        fixture.git(&["commit", "-qam", "second"]);
+        fixture.write("three\n");
+        let mut app = fixture.app_with_revs(&[]);
+        app.body = Rect::new(0, 0, 90, 20);
+        app.panes = [
+            Rect::new(0, 0, 26, 10),
+            Rect::new(0, 10, 26, 10),
+            Rect::new(26, 0, 32, 20),
+            Rect::new(58, 0, 32, 20),
+        ];
+        app.commits_height = 8;
+        app.commits.ensure_loaded(&app.repo, 8).unwrap();
+
+        // Row 11 on screen is the first row under the Commits border: the
+        // Working tree row; row 12 is the newest commit.
+        let click = |app: &mut App, row: u16| {
+            for kind in [
+                MouseEventKind::Down(MouseButton::Left),
+                MouseEventKind::Up(MouseButton::Left),
+            ] {
+                app.on_mouse(MouseEvent {
+                    kind,
+                    column: 5,
+                    row,
+                    modifiers: KeyModifiers::NONE,
+                });
+            }
+        };
+        click(&mut app, 12);
+        assert_eq!(app.focus, Pane::Commits);
+        assert_eq!(app.commits.cursor, 1);
+        assert!(app.commits.is_target(1), "one click, picked");
+        assert!(!app.repo.worktree(), "a commit's own changes");
+
+        // The wheel over the pane scrolls it and picks nothing: the cursor
+        // and the comparison stay where they were.
+        let labels = app.repo.labels();
+        app.commits.fill_for_test(50);
+        app.on_mouse(MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 5,
+            row: 15,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(app.commits.scroll > 0, "the view moved");
+        assert_eq!(app.commits.cursor, 1, "the cursor did not");
+        assert_eq!(app.repo.labels(), labels, "nor the comparison");
     }
 
     /// The border between the Changes pane and the Commits pane is a handle
