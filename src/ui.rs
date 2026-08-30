@@ -348,12 +348,18 @@ fn draw_commits(frame: &mut Frame, app: &mut App, area: Rect) {
 }
 
 /// A string cut to a number of display columns, so a wide glyph is never
-/// halved by the pane's edge.
+/// halved by the pane's edge. A character that takes no column is dropped,
+/// as `segments` drops it from a diff line: a commit subject is text anyone
+/// could have written, and a control character in it would otherwise reach
+/// the terminal as the escape sequence it is.
 fn cut(text: &str, room: usize) -> String {
     let mut out = String::new();
     let mut col = 0;
     for ch in text.chars() {
         let cells = ch.width().unwrap_or(0);
+        if cells == 0 {
+            continue;
+        }
         if col + cells > room {
             break;
         }
@@ -1107,6 +1113,16 @@ mod tests {
             !row("second commit").contains(TARGET_MARK),
             "which is not where the cursor is: {shown}"
         );
+    }
+
+    /// A subject is text anyone could have written. What reaches the terminal
+    /// is its printable columns and nothing else — never an escape sequence.
+    #[test]
+    fn a_commit_subject_cannot_write_to_the_terminal() {
+        // The escape byte is what makes a sequence; without it `[2J` is text.
+        assert_eq!(cut("ok\x1b[2Jnot", 10), "ok[2Jnot");
+        assert_eq!(cut("中文字", 4), "中文", "a wide glyph is never halved");
+        assert_eq!(cut("a\u{200b}b", 5), "ab", "nor a zero-width one kept");
     }
 
     /// A history of thousands is drawn a screen at a time: the rows behind

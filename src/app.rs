@@ -730,7 +730,9 @@ impl App {
         // the pane. Loaded here rather than at startup so the list is there
         // before the first key, not after it.
         let rows = self.commits.len();
-        let _ = self.commits.ensure_loaded(&self.repo, self.commits_height);
+        if let Err(err) = self.commits.ensure_loaded(&self.repo, self.commits_height) {
+            self.error = Some(err.to_string());
+        }
         let (scroll, hscroll) = (self.scroll, self.hscroll);
         self.scroll = self.scroll.min(self.max_scroll());
         self.hscroll = self.hscroll.min(self.max_hscroll());

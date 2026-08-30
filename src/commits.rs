@@ -280,7 +280,16 @@ impl Commits {
     pub fn ensure_loaded(&mut self, repo: &Repo, viewport: usize) -> Result<()> {
         let page = (viewport * 2).max(self.page_floor);
         while !self.exhausted && self.cursor.max(self.scroll) + viewport + 1 >= self.len() {
-            let next = repo.log_page(&self.tip, self.rows.len(), page)?;
+            // A history git cannot give — a tip that is not a commit — is not
+            // asked for again on every draw: the list ends where it is, and
+            // the caller says why once.
+            let next = match repo.log_page(&self.tip, self.rows.len(), page) {
+                Ok(next) => next,
+                Err(err) => {
+                    self.exhausted = true;
+                    return Err(err);
+                }
+            };
             self.exhausted = next.len() < page;
             if next.is_empty() {
                 break;
@@ -311,6 +320,7 @@ impl Commits {
                 .position(|c| c.hash == hash)
                 .map(|row| row + 1)
                 .unwrap_or(0);
+            self.keep_cursor_visible(viewport);
         }
         Ok(())
     }
@@ -357,7 +367,8 @@ impl Commits {
 /// would eat the pane. Abbreviated only when it is unmistakably an id, so a
 /// branch or tag is never touched.
 fn short(rev: String) -> String {
-    let is_id = rev.len() == 40 && rev.chars().all(|c| c.is_ascii_hexdigit());
+    // 40 under SHA-1, 64 under SHA-256.
+    let is_id = matches!(rev.len(), 40 | 64) && rev.chars().all(|c| c.is_ascii_hexdigit());
     match is_id {
         true => rev[..7].to_string(),
         false => rev,
@@ -586,6 +597,47 @@ mod tests {
         fixture.git(&["commit", "-qam", "third"]);
         commits.reload(&repo, 4).unwrap();
         assert!(commits.is_target(2), "same commit, one row down");
+    }
+
+    /// A history git cannot give is asked for once, not on every draw.
+    #[test]
+    fn a_history_git_refuses_is_asked_for_once() {
+        let fixture = crate::app::tests::Fixture::new("commits-refused", "a\n", "b\n");
+        let repo = crate::git::Repo::discover(fixture.dir()).unwrap();
+        let mut commits = Commits::new(OsString::from("nope"));
+
+        assert!(commits.ensure_loaded(&repo, 4).is_err(), "git says no");
+        assert_eq!(commits.len(), 1, "the Working tree row alone");
+        assert!(
+            commits.ensure_loaded(&repo, 4).is_ok(),
+            "and is not asked again"
+        );
+        assert_eq!(commits.position(), "1/1", "the list is what it is");
+    }
+
+    /// After a reload the cursor is where it was, and on screen.
+    #[test]
+    fn a_reload_keeps_the_cursor_on_screen() {
+        let fixture = crate::app::tests::Fixture::new("commits-visible", "one\n", "one\n");
+        for n in 2..=8 {
+            fixture.write(&format!("{n}\n"));
+            fixture.git(&["commit", "-qam", &format!("commit {n}")]);
+        }
+        let repo = crate::git::Repo::discover(fixture.dir()).unwrap();
+        let mut commits = Commits::new(OsString::from("HEAD"));
+        commits.ensure_loaded(&repo, 3).unwrap();
+        commits.move_cursor(6, &repo, 3).unwrap();
+        assert_eq!(commits.cursor, 6);
+        assert!(commits.scroll > 0, "the view followed");
+
+        commits.reload(&repo, 3).unwrap();
+        assert_eq!(commits.cursor, 6, "the same commit");
+        assert!(
+            (commits.scroll..commits.scroll + 3).contains(&commits.cursor),
+            "still on screen: scroll {} cursor {}",
+            commits.scroll,
+            commits.cursor
+        );
     }
 
     /// The view follows the cursor by the least it can, so a page up and a

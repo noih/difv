@@ -166,6 +166,9 @@ impl Repo {
             OsString::from("--"),
         ];
         let out = self.git(&args)?;
+        // Git ends each commit's record with a newline of its own after the
+        // last NUL, which lands at the front of the next hash — trimmed off
+        // below.
         let mut fields = out.split(|b| *b == 0);
         let mut page = Vec::new();
         while let (Some(hash), Some(short), Some(subject)) =
