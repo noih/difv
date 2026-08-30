@@ -124,7 +124,7 @@ const HELP: [(&str, &str); 14] = [
     ("Ctrl+S", "Save the file"),
     ("Ctrl+Z Ctrl+Y", "Undo / redo"),
     ("Ctrl+C Ctrl+X Ctrl+V", "Copy / cut / paste"),
-    ("Ctrl+B", "Hide / show the file list"),
+    ("Ctrl+B", "Hide / show the file and commit lists"),
     ("r", "Reload changes"),
     ("Esc", "Back to the file list"),
     ("q", "Quit"),
@@ -891,7 +891,7 @@ mod tests {
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
         let open = terminal.backend().to_string();
         assert!(open.contains("Keys"), "{open}");
-        assert!(open.contains("Hide / show the file list"), "{open}");
+        assert!(open.contains("Hide / show the file and commit lists"), "{open}");
     }
 
     /// What a terminal shows after ratatui's diff is applied to it. Ratatui's
