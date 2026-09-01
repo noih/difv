@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Cut a release: bump, tag, push, wait for the binaries, update the tap.
+# Cut a release: bump, tag, push, publish the crate, wait for the binaries,
+# update the tap.
 #
 #     scripts/release 1.0.1
 #
@@ -62,6 +63,13 @@ git tag -a "$tag" -m "difv $version"
 
 say "push main and $tag"
 git push origin main "$tag"
+
+# After the push: crates.io is the one step that cannot be taken back, so it
+# waits for the passphrase prompt that is your yes. If it fails here the tag
+# is already public — fix and run `cargo publish --locked` by hand, not the
+# script.
+say "publish to crates.io"
+cargo publish --locked
 
 say "wait for the release workflow"
 run=""

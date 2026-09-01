@@ -27,7 +27,7 @@ brew install noih/tap/difv
 Or, with a Rust toolchain (1.88+):
 
 ```bash
-cargo install --git https://github.com/noih/difv
+cargo install difv
 ```
 
 Apple Silicon macOS and Linux. `git` has to be on your `PATH`.
