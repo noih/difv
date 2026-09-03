@@ -6,6 +6,9 @@ rust-version = "1.88"
 description = "Review and tweak your Git changes side by side, in the terminal."
 license = "MIT"
 repository = "https://github.com/noih/difv"
+homepage = "https://github.com/noih/difv"
+keywords = ["git", "diff", "tui", "side-by-side", "code-review"]
+categories = ["development-tools", "command-line-utilities"]
 
 [dependencies]
 anyhow = "1"

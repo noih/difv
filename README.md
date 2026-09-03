@@ -1,6 +1,12 @@
-# difv
+# difv — side-by-side git diff in the terminal
 
-Review and tweak your Git changes side by side, in the terminal.
+[![crates.io](https://img.shields.io/crates/v/difv.svg)](https://crates.io/crates/difv)
+[![downloads](https://img.shields.io/crates/d/difv.svg)](https://crates.io/crates/difv)
+[![license](https://img.shields.io/crates/l/difv.svg)](https://github.com/noih/difv/blob/main/LICENSE)
+
+Review and tweak your Git changes side by side, in the terminal. A TUI diff
+viewer for `git diff` output that is also an editor, so a code review and the
+fixes it turns up happen in the same window.
 
 Three panes: your changed files, `HEAD`, and the working tree. The working-tree
 pane is an editor — fix the small things while you review, save, move on. Its
@@ -65,6 +71,11 @@ file to open on.
   `Esc` gets you back to the file list.
 - `?` shows every key. `,` opens the settings, which are also plain TOML in
   `~/.config/difv/config.toml` with every option explained.
+
+## Links
+
+- Source and issues: <https://github.com/noih/difv>
+- Package: <https://crates.io/crates/difv>
 
 ## License
 
