@@ -21,7 +21,6 @@
 set -euo pipefail
 
 REPO=noih/difv
-TAP=noih/tap
 TAP_REPO=git@github.com:noih/homebrew-tap.git
 
 version=${1:-}
@@ -31,15 +30,38 @@ tag=v$version
 say() { printf '\n\033[1m==> %s\033[0m\n' "$*"; }
 die() { echo "release: $*" >&2; exit 1; }
 
+check_tap() {
+  [[ -d $tapdir/Formula ]] || die "tap Formula directory is missing"
+  [[ $(git -C "$tapdir" rev-parse --show-toplevel) == "$tapdir" ]] || die "tap directory must be its Git repository root"
+  case $(git -C "$tapdir" remote get-url origin) in
+    https://github.com/noih/homebrew-tap|https://github.com/noih/homebrew-tap.git|git@github.com:noih/homebrew-tap|git@github.com:noih/homebrew-tap.git) ;;
+    *) die "tap origin is not noih/homebrew-tap" ;;
+  esac
+  [[ $(git -C "$tapdir" branch --show-current) == main ]] || die "tap must be on main"
+  [[ -z $(git -C "$tapdir" status --porcelain) ]] || die "tap working tree is not clean"
+  local remote_sha
+  remote_sha=$(gh api repos/noih/homebrew-tap/git/ref/heads/main --jq '.object.sha') || die "cannot read tap remote main"
+  [[ $(git -C "$tapdir" rev-parse HEAD) == "$remote_sha" ]] || die "tap main is not in sync with GitHub"
+}
+
 # --- preconditions -----------------------------------------------------------
+
+root=$(git rev-parse --show-toplevel)
+cd "$root"
 
 [[ $(git branch --show-current) == main ]] || die "run this on main"
 [[ -z $(git status --porcelain) ]] || die "working tree is not clean"
-git fetch -q origin
-[[ $(git rev-parse HEAD) == $(git rev-parse origin/main) ]] || die "main is not in sync with origin — push or pull first"
 git rev-parse -q --verify "refs/tags/$tag" >/dev/null && die "$tag already exists — a mistake in a published release is a new version"
 gh auth status >/dev/null 2>&1 || die "gh is not logged in"
 command -v cargo >/dev/null || die "cargo not found"
+remote_sha=$(gh api "repos/$REPO/git/ref/heads/main" --jq '.object.sha') || die "cannot read remote main"
+[[ $(git rev-parse HEAD) == "$remote_sha" ]] || die "main is not in sync with origin — push or pull first"
+
+tapdir=$(cd "$root/.." && pwd -P)/homebrew-tap
+[[ -d $tapdir ]] || die "create the sibling homebrew-tap developer checkout first"
+tapdir=$(cd "$tapdir" && pwd -P)
+check_tap
+tap_head=$(git -C "$tapdir" rev-parse HEAD)
 
 # --- bump --------------------------------------------------------------------
 
@@ -94,28 +116,20 @@ curl -fsIL -o /dev/null "$formula" \
 # --- tap ---------------------------------------------------------------------
 
 say "update the tap"
-if command -v brew >/dev/null; then
-  brew tap "$TAP" >/dev/null 2>&1 || true
-  tapdir=$(brew --repository "$TAP")
-  git -C "$tapdir" pull -q --ff-only
-else
-  tapdir=$(mktemp -d)
-  git clone -q "$TAP_REPO" "$tapdir"
-fi
+check_tap
+[[ $(git -C "$tapdir" rev-parse HEAD) == "$tap_head" ]] || die "tap HEAD changed during release"
 curl -fsSL "$formula" -o "$tapdir/Formula/difv.rb"
 
 if command -v brew >/dev/null; then
-  # The same checks the tap's test-bot runs, so a red build is caught here.
-  brew style "$TAP"
-  brew readall --os=all --arch=all "$TAP"
-  brew audit --strict --online "$TAP/difv"
+  # Style checks the developer copy; readall and audit need the installed tap.
+  brew style "$tapdir/Formula/difv.rb"
 fi
 
 git -C "$tapdir" add Formula/difv.rb
 git -C "$tapdir" commit -q -m "difv $version"
 
 say "released $tag — the tap is committed, and yours to push"
-echo "  git -C $tapdir push origin HEAD"
+printf '  git -C %q push %s main\n' "$tapdir" "$TAP_REPO"
 echo
 echo "  https://github.com/$REPO/releases/tag/$tag"
 echo "  brew upgrade difv    # once that push lands"

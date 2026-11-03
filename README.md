@@ -72,6 +72,25 @@ file to open on.
 - `?` shows every key. `,` opens the settings, which are also plain TOML in
   `~/.config/difv/config.toml` with every option explained.
 
+## Release
+
+Keep the developer checkouts side by side: `difv/` and `homebrew-tap/`.
+The sibling tap must be the root of a clean `main` checkout of
+`noih/homebrew-tap`, with HEAD matching GitHub. Run `scripts/release X.Y.Z`
+from a clean, synced difv `main`; it keeps the existing bump, checks, push,
+crate publication, and release workflow sequence.
+
+The script copies the published formula into the sibling developer checkout,
+runs `brew style` on that file when Homebrew is available, and commits it
+locally. Run the printed push command to
+`git@github.com:noih/homebrew-tap.git` yourself. The script leaves Homebrew's
+managed tap alone. After the tap push lands, update the installed tap with
+`brew update`, then run `brew readall --os=all --arch=all noih/tap` and
+`brew audit --strict --online noih/tap/difv` against that installed copy.
+
+Release-script regression checks: `python3 tests/release_script.py` (isolated
+fake commands; no publication or real tap writes).
+
 ## Links
 
 - Source and issues: <https://github.com/noih/difv>
